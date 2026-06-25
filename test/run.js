@@ -149,6 +149,98 @@ test('hanging wrap command is killed by timeout; bar still prints (exit 0)', fun
   assert.strictEqual(t.context_pct, 55);
 });
 
+// Synchronous bounded sleep (no child spawned), for the reaping poll below.
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// REGRESSION (the fork-bomb): a wrapped statusline command commonly shells out,
+// so the wrapped command has its OWN children. spawnSync's timeout SIGKILLs only
+// the direct child (the shell), orphaning those grandchildren; across many renders
+// x sessions the orphans pile up into a fork-bomb. The wrapper MUST kill the whole
+// process group on timeout. This test spawns a grandchild that records its pid and
+// then sleeps 60s; after the wrapper times out, that grandchild MUST be dead.
+test('timeout SIGKILLs the WHOLE process group: a wrapped command grandchild is reaped (no orphan)', function () {
+  const dir = tmpDir();
+  const pidfile = path.join(dir, 'gc.pid');
+  // CCT_WRAP is a node grandchild: it writes its pid, prints NOTHING, sleeps 60s.
+  // (statusline -> sh -> this node; under the old bug the node would be orphaned.)
+  const gc = process.execPath +
+    ' -e "var fs=require(\'fs\');fs.writeFileSync(process.env.GC_PIDFILE,String(process.pid));setTimeout(function(){},60000)"';
+  const r = runWrapper({
+    session_id: 's-orphan',
+    context_window: { used_percentage: 50, context_window_size: 200000 },
+  }, { CCT_DIR: dir, CCT_WRAP: gc, CCT_WRAP_TIMEOUT_MS: '500', GC_PIDFILE: pidfile });
+  assert.strictEqual(r.status, 0, 'fell through to standalone, exit 0');
+  assert.ok(/ctx 50%/.test(r.stdout), 'standalone bar printed after kill');
+  // The grandchild must have started and recorded its pid before the timeout.
+  assert.ok(fs.existsSync(pidfile), 'grandchild started and wrote its pid');
+  const gpid = parseInt(fs.readFileSync(pidfile, 'utf8'), 10);
+  assert.ok(gpid > 0, 'valid grandchild pid');
+  // It must now be DEAD (group-killed). Poll briefly (bounded <= ~2s) for reaping.
+  let alive = true;
+  for (let i = 0; i < 40; i++) {
+    try { process.kill(gpid, 0); } catch (e) { alive = false; break; } // ESRCH => gone
+    sleepSync(50);
+  }
+  // ALWAYS clean up: if the fix regressed, never leak the 60s sleeper.
+  if (alive) { try { process.kill(gpid, 'SIGKILL'); } catch (e) {} }
+  assert.strictEqual(alive, false, 'grandchild was reaped by group-kill (NOT orphaned)');
+});
+
+// REGRESSION (the HANG the devil's-advocate found): a wrapped command that
+// DAEMONIZES (detached/setsid double-fork) puts a helper into its OWN process
+// group, which escapes our group-kill AND inherits our stdout pipe. With a design
+// that waited only on 'close', that pipe stays open forever, 'close' never fires,
+// and bin/statusline.js HANGS - freezing the bar and leaking a stuck wrapper per
+// render. We cannot kill the escapee (it detached itself, by OS design), but the
+// WRAPPER MUST STILL EXIT promptly. This test proves it exits and prints a bar; it
+// would hang (spawnSync hits its 10s timeout, status null) against a 'close'-only
+// design. The escapee is killed in cleanup.
+test('daemonizing wrap that holds the stdout pipe does NOT hang the wrapper (it exits + prints a bar)', function () {
+  const dir = tmpDir();
+  const pidfile = path.join(dir, 'daemon.pid');
+  // gc.js: the escapee. Inherits stdio (holds our stdout fd) and just sleeps.
+  const gcScript = path.join(dir, 'gc.js');
+  fs.writeFileSync(gcScript, "setTimeout(function(){}, 30000);\n");
+  // launcher.js: spawns the escapee DETACHED (new group, escapes our group-kill)
+  // with stdio:'inherit' (so it holds our stdout pipe). It records the escapee's pid
+  // SYNCHRONOUSLY (it knows c.pid at spawn) BEFORE exiting, so the pidfile is
+  // guaranteed present the instant the launcher exits - the cleanup below can never
+  // race a slow grandchild boot and leak the 30s sleeper.
+  const launcher = path.join(dir, 'launcher.js');
+  fs.writeFileSync(launcher,
+    "var cp=require('child_process');\n" +
+    "var fs=require('fs');\n" +
+    "var c=cp.spawn(process.execPath,[process.env.GC_SCRIPT],{detached:true,stdio:'inherit'});\n" +
+    "fs.writeFileSync(process.env.GC_PIDFILE, String(c.pid));\n" +
+    "c.unref();\n" +
+    "process.exit(0);\n");
+  const wrap = process.execPath + ' ' + JSON.stringify(launcher);
+  const r = runWrapper({
+    session_id: 's-daemon',
+    context_window: { used_percentage: 66, context_window_size: 200000 },
+  }, { CCT_DIR: dir, CCT_WRAP: wrap, CCT_WRAP_TIMEOUT_MS: '1500', GC_SCRIPT: gcScript, GC_PIDFILE: pidfile });
+
+  // Read + kill the escapee FIRST (always clean up, even if assertions below fail).
+  // The launcher writes the pidfile synchronously before exiting, so it is present
+  // by the time runWrapper returns; the short poll is belt-and-suspenders.
+  let dpid = -1;
+  for (let i = 0; i < 40; i++) {
+    try { dpid = parseInt(fs.readFileSync(pidfile, 'utf8'), 10); } catch (e) {}
+    if (dpid > 0) break;
+    sleepSync(50);
+  }
+  if (dpid > 0) { try { process.kill(dpid, 'SIGKILL'); } catch (e) {} }
+
+  // The wrapper EXITED (did not hang): spawnSync returned a real status, not the
+  // null+SIGTERM of a 10s-timeout kill. And it printed a bar (its standalone one,
+  // since the daemonizing wrap produced no stdout of its own before exiting).
+  assert.strictEqual(r.signal, null, 'wrapper was NOT killed by the test timeout (no hang)');
+  assert.strictEqual(r.status, 0, 'wrapper exited 0');
+  assert.ok(/ctx 66%/.test(r.stdout), 'standalone bar printed, not frozen');
+});
+
 // ---- readTelemetry freshness ------------------------------------------------
 
 test('readTelemetry returns null when the file is absent', function () {

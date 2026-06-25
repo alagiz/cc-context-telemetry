@@ -120,8 +120,11 @@ compaction.
 - `CCT_WRAP` - your original statusline command. The wrapper runs it with the same
   stdin and forwards its output verbatim. When unset, the wrapper prints its own
   minimal bar (`ctx 47% | 5h 12% | 7d 30%`).
-- `CCT_WRAP_TIMEOUT_MS` - SIGKILL-bounded timeout for the wrapped command (default
-  5000). If it hangs, it is killed and the bar still prints.
+- `CCT_WRAP_TIMEOUT_MS` - timeout in milliseconds for the wrapped command (default
+  5000). On timeout the wrapper SIGKILLs the wrapped command's ENTIRE process group
+  (not just the shell) so a command that shells out leaves no orphaned children, and
+  the bar still prints. The wrapper ALWAYS exits by this deadline at the latest, even
+  if the wrapped command daemonizes and holds the pipe open (see Process handling).
 - `CCT_DIR` - telemetry directory (default `~/.claude/cc-context-telemetry/`).
 - `CCT_TTL_SEC` - freshness window for `readTelemetry` in seconds (default 120).
 - `CCT_DEBUG` - when set to a truthy value (e.g. `1`, `true`, `yes`), the wrapper
@@ -132,6 +135,27 @@ compaction.
   code). Use it to inspect the real payload field paths when telemetry comes back
   null. The dump may contain real session content, overwrites in place, and is
   NOT auto-cleaned, so delete it when you are done.
+
+## Process handling (why the wrapper is safe to run every render)
+
+Claude Code runs the statusLine command on every render, in every open session. A
+wrapper that runs your original statusline command (`CCT_WRAP`) must therefore be
+disciplined about the processes it starts, or they pile up. This wrapper guarantees:
+
+- It runs the wrapped command in its OWN process group and, on timeout or output
+  overflow, SIGKILLs the WHOLE group. A wrapped statusline that shells out to helper
+  commands leaves NO orphaned children. (Killing only the direct shell, as a naive
+  `spawnSync` timeout does, orphans those helpers; across many renders and sessions
+  that accumulates.)
+- The wrapper ALWAYS exits, by the `CCT_WRAP_TIMEOUT_MS` deadline at the latest. It
+  never waits indefinitely on the wrapped command's output, so it cannot freeze your
+  bar or leave a stuck process behind per render.
+
+One limit, by OS design: if your wrapped command DELIBERATELY daemonizes a helper
+(double-fork / `setsid` / `nohup ... &`), that helper detaches into its own session
+and the wrapper cannot kill it - exactly as if you ran that command as your statusLine
+directly, without this wrapper. The wrapper still exits promptly; only the helper your
+own command intentionally backgrounded keeps running.
 
 ## Verify it works (one cheap session)
 

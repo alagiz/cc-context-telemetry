@@ -19,9 +19,15 @@
 //     A SIGKILL-bounded timeout (env CCT_WRAP_TIMEOUT_MS, default 5000) guards a
 //     hanging child. On any wrap error or empty output, fall through to a minimal
 //     standalone bar rather than blanking.
+//   - PROCESS-GROUP CONTAINMENT: the wrapped command is a shell string that may
+//     itself spawn children (a user's statusline often shells out). It runs in its
+//     OWN process group (detached), and on timeout / overflow we SIGKILL the WHOLE
+//     group, not just the shell. spawnSync's timeout only kills the direct child,
+//     which orphans grandchildren; across many renders x sessions those orphans
+//     accumulate into a fork-bomb. This is why this wrapper MUST use group-kill.
 //   - No per-model / per-plan / per-window assumptions: every field is read
 //     straight from the payload (omit, never fabricate, what is absent).
-const { spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const tel = require('../index.js');
@@ -97,48 +103,138 @@ try {
   tel.writeTelemetry(sessionId, out);
 } catch (e) { /* telemetry is best-effort; never affect output */ }
 
+// STANDALONE segment (no wrapper configured, or it produced nothing): render a
+// minimal own bar so a standalone install shows something. Plain text ONLY, no
+// emoji (the project rule forbids emoji everywhere, including statusline output).
+// Always print SOMETHING; always exit 0.
+function renderStandalone() {
+  function pct(p) { return (typeof p === 'number') ? Math.round(p) + '%' : '--'; }
+  const parts = ['ctx ' + pct(ctxPct)];
+  if (typeof fiveH === 'number') parts.push('5h ' + pct(fiveH));
+  if (typeof sevenD === 'number') parts.push('7d ' + pct(sevenD));
+  try { process.stdout.write(parts.join(' | ')); }
+  catch (e) { try { process.stdout.write('ctx --'); } catch (e2) {} }
+  process.exit(0);
+}
+
+function wrapTimeoutMs() {
+  const t = Number(process.env.CCT_WRAP_TIMEOUT_MS);
+  return (isFinite(t) && t > 0) ? t : 5000;
+}
+
+// Run the wrapped command in its OWN process group and SIGKILL the WHOLE group on
+// timeout / overflow, so a slow command that spawned children leaves NO orphans.
+// Calls done(childOut, status, broke) EXACTLY once, and GUARANTEES the wrapper
+// eventually exits even if a wrapped command daemonizes and holds our stdout pipe
+// open. Never throws.
+function runWrap(wrap, input, timeoutMs, done) {
+  const MAXBUF = 10 * 1024 * 1024;
+  let child;
+  try {
+    child = spawn(wrap, {
+      shell: true,
+      // detached => the shell leads a NEW process group, so process.kill(-pid, ...)
+      // reaps the shell AND every child it spawned that STAYS in the group (the
+      // common case for a statusline that shells out).
+      detached: true,
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+  } catch (e) {
+    return done('', 0, true);
+  }
+  if (!child || typeof child.pid !== 'number') {
+    return done('', 0, true);
+  }
+
+  let out = '';
+  let settled = false;
+  let killedByUs = false;
+  let exitCode = 0;
+
+  function killGroup() {
+    // SIGKILL the whole process group (negative pid); fall back to the lone child
+    // where there are no POSIX groups (Windows). A wrapped command that DELIBERATELY
+    // daemonizes (setsid / double-fork) moves into its OWN session and escapes this -
+    // by OS design, and identical to running that command as the statusline directly.
+    // We cannot, and should not, kill a process that detached itself. What we DO
+    // guarantee is that THIS wrapper always exits (see settle + the hard deadline).
+    try { process.kill(-child.pid, 'SIGKILL'); }
+    catch (e) { try { child.kill('SIGKILL'); } catch (e2) {} }
+  }
+
+  function settle(status, broke) {
+    if (settled) return;
+    settled = true;
+    clearTimeout(hardTimer);
+    // done() force-exits via process.exit(); any stdout fd a re-parented grandchild
+    // still holds open cannot keep us alive past that, so the wrapper never hangs.
+    done(out, status, broke);
+  }
+
+  // HARD DEADLINE - intentionally NOT unref'd, so it ALWAYS fires and SETTLES (not
+  // merely kills) even if every other handle is gone. A daemonizing wrapped command
+  // can hold the stdout pipe open so 'close' never fires; a design that only killed
+  // here, or that relied on 'close' alone, would freeze the bar forever. This
+  // backstop guarantees we kill the group AND exit.
+  const hardTimer = setTimeout(function () {
+    killedByUs = true;
+    killGroup();
+    settle(0, true);
+  }, timeoutMs);
+
+  child.on('error', function () { settle(0, true); });
+
+  if (child.stdout) {
+    child.stdout.on('error', function () {});
+    child.stdout.on('data', function (chunk) {
+      if (out.length >= MAXBUF) return;
+      out += chunk.toString('utf8');
+      if (out.length >= MAXBUF) { killedByUs = true; killGroup(); settle(0, true); }
+    });
+  }
+
+  // 'exit' fires when the DIRECT child (the shell) terminates, INDEPENDENT of any
+  // stdout fd a grandchild may still hold. 'close' (full stdout drain) is preferred
+  // when it arrives promptly; otherwise a short grace settles us so a pipe-holding
+  // escapee cannot wedge the bar until the hard deadline.
+  child.on('exit', function (code) {
+    exitCode = (typeof code === 'number') ? code : 0;
+    const grace = setTimeout(function () {
+      settle(exitCode, killedByUs || out.length === 0);
+    }, 200);
+    if (grace && typeof grace.unref === 'function') grace.unref();
+  });
+  child.on('close', function (code) {
+    if (typeof code === 'number') exitCode = code;
+    // EMPTY child stdout is ALWAYS "broke", regardless of exit status: a wrapped
+    // command that exits 0 but prints nothing (e.g. `true`) must NOT blank the bar.
+    // A timeout/overflow kill (killedByUs) is likewise broke.
+    settle(exitCode, killedByUs || out.length === 0);
+  });
+
+  // Feed the SAME captured stdin, then close it. Never let a broken pipe throw.
+  try {
+    if (child.stdin) {
+      child.stdin.on('error', function () {});
+      child.stdin.write(input);
+      child.stdin.end();
+    }
+  } catch (e) { /* child may have already exited; exit/close/deadline cover it */ }
+}
+
 // PASS-THROUGH: run the user's original statusline command with the SAME stdin,
 // forward its stdout verbatim, propagate its exit code. On any error / timeout /
 // empty output, fall through to the standalone bar (never blank).
 const wrap = process.env.CCT_WRAP;
 if (wrap && String(wrap).trim()) {
-  try {
-    const wrapTimeout = Number(process.env.CCT_WRAP_TIMEOUT_MS);
-    const r = spawnSync(wrap, {
-      input: raw,
-      shell: true,
-      encoding: 'utf8',
-      maxBuffer: 10 * 1024 * 1024,
-      timeout: isFinite(wrapTimeout) && wrapTimeout > 0 ? wrapTimeout : 5000,
-      killSignal: 'SIGKILL',
-    });
-    const childOut = (r && typeof r.stdout === 'string') ? r.stdout : '';
-    // Propagate the child's exit code WHEN it produced a bar (stdout). If the
-    // wrapped command broke - a spawn error, a TIMEOUT (r.error, status null,
-    // empty stdout after SIGKILL), OR a non-zero exit with NO output (e.g.
-    // command-not-found 127) - do NOT blank the bar over our wrapper.
-    const status = (r && typeof r.status === 'number') ? r.status : 0;
-    // EMPTY child stdout is ALWAYS "broke", regardless of exit status: a wrapped
-    // command that exits 0 but prints nothing (e.g. `true`, or one that writes
-    // only to stderr) must NOT blank the bar - fall through to the standalone bar.
-    const broke = !r || r.error || childOut.length === 0 || (status !== 0 && childOut.length === 0);
-    if (!broke) { process.stdout.write(childOut); process.exit(status); }
-    // Broke but still printed something: forward it and exit 0. Printed nothing
-    // (timeout / spawn error): fall through to the standalone bar below.
-    if (childOut.length > 0) { process.stdout.write(childOut); process.exit(0); }
-  } catch (e) {
-    // Could not even spawn: fall through to the standalone bar (never blank).
-  }
+  runWrap(wrap, raw, wrapTimeoutMs(), (childOut, status, broke) => {
+    // Produced a real bar and exited cleanly: forward it, propagate exit code.
+    if (!broke) { try { process.stdout.write(childOut); } catch (e) {} return process.exit(status); }
+    // Broke but still printed something: forward it and exit 0.
+    if (childOut && childOut.length > 0) { try { process.stdout.write(childOut); } catch (e) {} return process.exit(0); }
+    // Printed nothing (timeout / spawn error / empty): fall through to standalone.
+    renderStandalone();
+  });
+} else {
+  renderStandalone();
 }
-
-// STANDALONE segment (no wrapper configured, or it produced nothing): render a
-// minimal own bar so a standalone install shows something. Plain text ONLY, no
-// emoji (the project rule forbids emoji everywhere, including statusline output).
-// Always print SOMETHING; always exit 0.
-function pct(p) { return (typeof p === 'number') ? Math.round(p) + '%' : '--'; }
-const parts = ['ctx ' + pct(ctxPct)];
-if (typeof fiveH === 'number') parts.push('5h ' + pct(fiveH));
-if (typeof sevenD === 'number') parts.push('7d ' + pct(sevenD));
-try { process.stdout.write(parts.join(' | ')); }
-catch (e) { try { process.stdout.write('ctx --'); } catch (e2) {} }
-process.exit(0);
