@@ -1,12 +1,21 @@
 # cc-context-telemetry
 
+Show Claude Code's context % and Pro/Max rate-limit usage right next to your
+existing statusline bar.
+
+    before:   main  $9.07  21:04
+
+    after:    ctx 48% | 5h 14% | 7d 50%   main  $9.07  21:04
+
+The trailing part is whatever your own statusline prints - this works with ANY
+statusline command, not a specific one.
+
 Claude Code hooks and plugins cannot see context fullness or rate limits. The ONLY
-place Claude Code exposes the authoritative `context_window` (used percentage,
-window size) and Pro/Max `rate_limits` is the `statusLine` command. This tiny,
-zero-dependency library bridges that gap: it is a statusLine wrapper that captures
-Claude Code's authoritative telemetry to a per-session file your hooks can read, and
-renders a compact `ctx % | 5h % | 7d %` segment in front of your existing statusline
-bar - the context/usage readout shown next to whatever bar you already use.
+place Claude Code exposes the authoritative `context_window` (used percentage, window
+size) and Pro/Max `rate_limits` is the `statusLine` command. This tiny, zero-dependency
+library bridges that gap: a statusLine wrapper that prepends a compact
+`ctx % | 5h % | 7d %` segment to your own bar and also writes that telemetry to a
+per-session file your hooks can read.
 
 One job, three pieces:
 
@@ -30,43 +39,28 @@ One job, three pieces:
 Zero third-party dependencies. Node >= 18. POSIX shell (Linux/macOS). Never throws,
 never calls `claude`.
 
-## Wiring
+## Quick start
 
-Add this to `~/.claude/settings.json` (use an absolute path to the entry script, or
-the `cc-context-telemetry-statusline` command if installed globally):
+```bash
+npm i -g cc-context-telemetry
+```
+
+Wire it as your `statusLine` in `~/.claude/settings.json`, pointing `CCT_WRAP` at your
+current statusline command so the segment shows in front of your bar:
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "/absolute/path/to/cc-context-telemetry/bin/cct-statusline"
+    "command": "cc-context-telemetry-statusline",
+    "env": { "CCT_WRAP": "<your current statusLine command>" }
   }
 }
 ```
 
-To keep your existing bar, point `CCT_WRAP` at your original statusline command. The
-entry prints its `ctx % | 5h % | 7d %` segment and then `exec`s your command with the
-same stdin, so the statusLine is that segment followed by your own bar on one line:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "/absolute/path/to/cc-context-telemetry/bin/cct-statusline",
-    "env": {
-      "CCT_WRAP": "node /absolute/path/to/your/original-statusline.js"
-    }
-  }
-}
-```
-
-With that wiring your statusLine renders as the telemetry segment followed by your own
-bar on one line. This works with ANY statusline command (it is not specific to any
-one), for example:
-
-```
-ctx 48% | 5h 14% | 7d 50%   <whatever your CCT_WRAP command prints>
-```
+Done - your bar now starts with `ctx % | 5h % | 7d %`. With no `CCT_WRAP` the segment is
+your whole bar. (Prefer a stable absolute path? Point `command` at an installed or
+checked-out `bin/cct-statusline` instead of the global shim.)
 
 (If your Claude Code version does not support an `env` block on `statusLine`, export
 `CCT_WRAP` in your shell profile instead. The per-render path is pure shell, so no
