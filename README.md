@@ -5,17 +5,19 @@ place Claude Code exposes the authoritative `context_window` (used percentage,
 window size) and Pro/Max `rate_limits` is the `statusLine` command. This tiny,
 zero-dependency library bridges that gap: it is a statusLine wrapper that captures
 Claude Code's authoritative telemetry to a per-session file your hooks can read, and
-passes through to your existing statusline so you keep your bar.
+renders a compact `ctx % | 5h % | 7d %` segment in front of your existing statusline
+bar - the context/usage readout shown next to whatever bar you already use.
 
 One job, three pieces:
 
 - `bin/cct-statusline` - the POSIX shell entry Claude Code calls as its statusLine,
   every render. It is **pure shell, with NO Node on the per-render path**: it reads the
   payload once, extracts the session id, and atomically writes the RAW payload to
-  `telemetry-raw-<session>.json`. Then, if `CCT_WRAP` is set to your original
-  statusline command, it **`exec`s that command** so it BECOMES the statusLine process
-  (see Process handling for why this matters); in standalone mode it prints a minimal
-  bar so the segment is never blank. There is no per-render Node spawn at all (an
+  `telemetry-raw-<session>.json`. Then it prints a compact `ctx % | 5h % | 7d %`
+  segment and, if `CCT_WRAP` is set to your original statusline command, **`exec`s that
+  command** so its bar appends right after the segment on the same line and it BECOMES
+  the statusLine process (see Process handling for why this matters); with no `CCT_WRAP`
+  the segment is the whole bar, never blank. There is no per-render Node spawn at all (an
   earlier design spawned `node` every render; across many sessions that piled up - see
   Process handling).
 - `index.js` - the consumer. `readTelemetry(sessionId)` reads the raw payload file,
@@ -43,8 +45,8 @@ the `cc-context-telemetry-statusline` command if installed globally):
 ```
 
 To keep your existing bar, point `CCT_WRAP` at your original statusline command. The
-entry `exec`s it with the same stdin so you keep your bar, and Claude Code manages it
-exactly as if it were your statusLine directly:
+entry prints its `ctx % | 5h % | 7d %` segment and then `exec`s your command with the
+same stdin, so the statusLine is that segment followed by your own bar on one line:
 
 ```json
 {
@@ -56,6 +58,14 @@ exactly as if it were your statusLine directly:
     }
   }
 }
+```
+
+With that wiring your statusLine renders as the telemetry segment followed by your own
+bar on one line. This works with ANY statusline command (it is not specific to any
+one), for example:
+
+```
+ctx 48% | 5h 14% | 7d 50%   <whatever your CCT_WRAP command prints>
 ```
 
 (If your Claude Code version does not support an `env` block on `statusLine`, export

@@ -77,34 +77,10 @@ if cp "$tmp" "$raw_tmp" 2>/dev/null; then
   mv -f "$raw_tmp" "$raw_final" 2>/dev/null || rm -f "$raw_tmp" 2>/dev/null || true
 fi
 
-# WRAP mode: become the user's statusline. Use fd 3 so the temp file can be unlinked
-# immediately (no temp litter); eval honors the shell quoting in CCT_WRAP.
-if [ -n "${CCT_WRAP:-}" ] && [ -n "$(printf '%s' "${CCT_WRAP:-}" | tr -d '[:space:]')" ]; then
-  exec 3< "$tmp"
-  rm -f "$tmp"
-  # `eval` parses a quoted command string ("'/path/adtention' status"); `exec` then
-  # replaces THIS shell with that command so it BECOMES the statusline process. When
-  # Claude Code kills the statusline every render, the exec'd command (and any
-  # children in its session) are torn down too. We deliberately do NOT route through
-  # `sh -c "$CCT_WRAP"` (which may FORK and leave an orphan on a per-render kill), and
-  # we NEVER detach (the old catastrophic pile-up required a detached child that
-  # survived the render-kill).
-  #
-  # Do NOT background your statusLine with a trailing `&`: a statusLine that backgrounds
-  # a helper which outlives the front pid leaks that helper on EVERY render-kill - and
-  # it leaks IDENTICALLY under direct use and under this wrapper. Because exec makes the
-  # wrapped command BECOME the process Claude Code kills, the process tree is the same as
-  # running it directly, so the wrapper adds NO extra orphan; the leak is the forking
-  # statusline's own foot-gun, not the wrapper's. test/loadrepro proves this with a
-  # forking callee run both ways: the orphan counts are EQUAL (FDIR == FWRP).
-  eval "exec ${CCT_WRAP} <&3"
-  # exec replaces this shell on success. A missing command exits 127 (blank that one
-  # render, self-evident); we NEVER spawn a fallback. Defensive no-op below.
-  exit 0
-fi
-
-# STANDALONE mode (no CCT_WRAP): print a minimal plain-text bar from a cheap shell
-# extraction of the payload. No emoji (project rule). Never blank.
+# Build the telemetry SEGMENT (ctx / 5h / 7d) from the payload in cheap pure shell.
+# It is shown in BOTH modes: PREPENDED to the wrapped statusline's bar in WRAP mode (so
+# you see "ctx 66% | 5h 12% | 7d 30% <your adtention bar>"), or rendered as the whole
+# bar in STANDALONE mode. No emoji (project rule). Never blank.
 #
 # Extract context_window.used_percentage and rate_limits 5h/7d used_percentage. The
 # payload nests used_percentage under several keys, so we scope each match to its
@@ -112,45 +88,88 @@ fi
 # INSIDE rate_limits.five_hour / seven_day. We match the smallest object span per key.
 # A number may be int or float, possibly null. Bounded sed over the small one-line
 # payload; on no match the field is "--" (never fabricated, never blanked).
-extract_pct() {
-  # $1 = the JSON object key (e.g. context_window, five_hour). Prints a rounded int %,
-  # or empty if absent/null. Finds the key, then the FIRST used_percentage number after
-  # it. Bounded: operates on the single payload buffer, no loops.
-  #
-  # STANDALONE-DISPLAY-ONLY parser, with KNOWN, DELIBERATE assumptions (this is a cheap
-  # shell bar, NOT the authoritative reader):
-  #   - assumes the payload is ONE line (Claude Code emits a single-line statusline
-  #     JSON); a pretty-printed / multi-line payload would not match -> "--".
-  #   - assumes used_percentage sits DIRECTLY inside the named object's first `{...}`
-  #     span: the `[^}]*` stops at the first `}`, so a nested object BEFORE
-  #     used_percentage inside that object (e.g. {"foo":{...},"used_percentage":47})
-  #     would not match -> "--".
-  #   - assumes a plain decimal value; scientific notation (1e2), +/- signs, etc. are
-  #     not matched -> "--".
-  # On ANY of these the field is "--", never fabricated and never a blank bar - a
-  # conservative, fail-soft display miss. We do NOT over-engineer this shell parser:
-  # the AUTHORITATIVE consumer path is index.js (real JSON.parse via readTelemetry),
-  # which is robust to all of the above; this standalone bar only renders when no
-  # CCT_WRAP is set and is purely cosmetic.
-  key="$1"
-  # Pull the substring starting at the key, then grab the first used_percentage value.
-  sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*{[^}]*"used_percentage"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\(\.[0-9]*\)\{0,1\}\).*/\1/p' "$tmp" 2>/dev/null | head -n 1
-}
-# Round a decimal string to an integer with awk (present on every POSIX system). Empty
-# in -> empty out.
-round_pct() {
-  v="$1"
-  [ -n "$v" ] || { printf ''; return; }
-  awk -v x="$v" 'BEGIN{ printf "%d", x + 0.5 }' 2>/dev/null
-}
+# Build the segment in ONE awk pass (one cheap process, not Node). For each object
+# key, find the key name, then the FIRST "used_percentage": NUMBER that follows it.
+# This is robust to nested objects BEFORE used_percentage (e.g. context_window's
+# "current_usage":{...} which has no used_percentage of its own, so the first
+# used_percentage after "context_window" is the real one). five_hour / seven_day are
+# flat. A null or absent value yields no match -> that field is omitted/"--". index()
+# of "\"key\"" (with quotes) does not match "context_window_size". DISPLAY-ONLY and
+# fail-soft: never fabricates, never blanks. The AUTHORITATIVE path remains index.js
+# (real JSON.parse via readTelemetry); this segment is cosmetic.
+seg="$(awk '
+  # Return the text INSIDE key '"'"'s object, bounded by its matching braces (so the
+  # search can never bleed into a later sibling object like rate_limits).
+  function objspan(key,   p, i, n, depth, start, c) {
+    p = index(J, "\"" key "\"")
+    if (p == 0) return ""
+    n = length(J); i = p
+    while (i <= n && substr(J, i, 1) != "{") i++
+    if (i > n) return ""
+    start = i; depth = 0
+    while (i <= n) {
+      c = substr(J, i, 1)
+      if (c == "{") depth++
+      else if (c == "}") { depth--; if (depth == 0) return substr(J, start + 1, i - start - 1) }
+      i++
+    }
+    return ""
+  }
+  # used_percentage that belongs to key directly: take key'"'"'s object, drop any nested
+  # objects (e.g. context_window'"'"'s current_usage), then read its own used_percentage.
+  function up(key,   t) {
+    t = objspan(key)
+    if (t == "") return ""
+    gsub(/\{[^{}]*\}/, "", t)
+    if (match(t, /"used_percentage"[ \t]*:[ \t]*[0-9]+(\.[0-9]+)?/) == 0) return ""
+    t = substr(t, RSTART, RLENGTH)
+    sub(/.*:[ \t]*/, "", t)
+    return t
+  }
+  function rnd(v) { if (v == "") return ""; return int(v + 0.5) }
+  # Slurp ALL input lines into J and process ONCE in END, so a multi-line / pretty-
+  # printed payload is handled as a single record (concatenated) instead of the action
+  # running per line and garbling the segment. Claude Code emits single-line JSON, but
+  # this makes the cosmetic segment robust either way.
+  { J = J $0 }
+  END {
+    c = rnd(up("context_window")); h = rnd(up("five_hour")); d = rnd(up("seven_day"))
+    s = (c == "") ? "ctx --" : ("ctx " c "%")
+    if (h != "") s = s " | 5h " h "%"
+    if (d != "") s = s " | 7d " d "%"
+    printf "%s", s
+  }
+' "$tmp" 2>/dev/null)"
+[ -n "$seg" ] || seg="ctx --"
 
-ctx="$(round_pct "$(extract_pct context_window)")"
-h5="$(round_pct "$(extract_pct five_hour)")"
-d7="$(round_pct "$(extract_pct seven_day)")"
+# WRAP mode: PRINT our telemetry segment, then EXEC the wrapped statusline so its bar
+# appends on the SAME line ("ctx 66% | 5h 12% | 7d 30% <wrapped bar>"). Printing BEFORE
+# exec preserves the no-orphan property: the wrapped command still BECOMES the process
+# Claude Code kills (no spawn, no detach, no per-render Node). The segment is emitted
+# from a subshell so its bytes are FLUSHED to stdout before exec hands the fd to the
+# wrapped command (a plain builtin printf can sit in the shell output buffer that exec
+# would discard). That subshell is one cheap, synchronously-reaped fork, like the awk
+# calls above - not a lingering process.
+#
+# We do NOT route through `sh -c "$CCT_WRAP"` (which may FORK and leave an orphan on a
+# per-render kill), and we NEVER detach. Do NOT background your statusLine with a
+# trailing `&`: a statusLine that backgrounds a helper outliving the front pid leaks it
+# on every render-kill - IDENTICALLY under direct use and under this wrapper (exec makes
+# the wrapped command BECOME the killed process, so the tree matches direct; the leak is
+# the forking statusline's own foot-gun, not the wrapper's). test/loadrepro proves this
+# (forking callee run both ways: FDIR == FWRP).
+if [ -n "${CCT_WRAP:-}" ] && [ -n "$(printf '%s' "${CCT_WRAP:-}" | tr -d '[:space:]')" ]; then
+  ( printf '%s ' "$seg" )
+  exec 3< "$tmp"
+  rm -f "$tmp"
+  # `eval` parses a quoted command string ("'/path/adtention' status"); `exec` replaces
+  # THIS shell with it so it becomes the killed process. A missing command exits 127
+  # (the segment still printed); we NEVER spawn a fallback.
+  eval "exec ${CCT_WRAP} <&3"
+  exit 0
+fi
+
+# STANDALONE mode (no CCT_WRAP): the telemetry segment IS the whole bar.
 rm -f "$tmp"
-
-if [ -n "$ctx" ]; then bar="ctx ${ctx}%"; else bar="ctx --"; fi
-[ -n "$h5" ] && bar="$bar | 5h ${h5}%"
-[ -n "$d7" ] && bar="$bar | 7d ${d7}%"
-printf '%s' "$bar"
+printf '%s' "$seg"
 exit 0

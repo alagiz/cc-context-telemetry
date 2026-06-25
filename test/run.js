@@ -210,42 +210,102 @@ test('standalone bar: malformed/empty stdin -> "ctx --", exit 0', function () {
 // (4) WRAP-MODE exec passthrough
 // ============================================================================
 
-test('wrap mode EXECs CCT_WRAP, prints ITS bar verbatim, still writes raw telemetry', function () {
+// NEW WRAP BEHAVIOR: wrap mode PREPENDS the telemetry segment, then EXECs the wrapped
+// command, so stdout = "<segment> " + wrapped-command-output (one line). The wrapped
+// command still gets the EXACT payload on its stdin (fd3), and its exit code still
+// propagates (exec). Each test below asserts the same real invariant it always did,
+// now accounting for the segment prefix.
+test('wrap mode PREPENDS the segment then EXECs CCT_WRAP, prints ITS bar, still writes raw telemetry', function () {
   const dir = tmpDir(); process.env.CCT_DIR = dir;
+  // ctx 5%, NO rate_limits -> segment is "ctx 5%"; wrap prints "MY-REAL-BAR" after it.
   const r = runEntry({ session_id: 'e-wrap', context_window: { used_percentage: 5, context_window_size: 200000 } },
     { CCT_DIR: dir, CCT_WRAP: "printf 'MY-REAL-BAR'" });
-  assert.strictEqual(r.stdout, 'MY-REAL-BAR', 'verbatim wrapped output');
+  assert.strictEqual(r.stdout, 'ctx 5% MY-REAL-BAR', 'segment prefix + verbatim wrapped output');
   assert.strictEqual(r.status, 0);
   assert.strictEqual(api.readTelemetry('e-wrap').contextPct, 5, 'raw telemetry written under wrap');
+  // No emoji: every byte is ASCII printable.
+  assert.ok(/^[\x20-\x7e]*$/.test(r.stdout), 'wrap output is plain ASCII (no emoji)');
   delete process.env.CCT_DIR;
 });
 
-test('wrap mode propagates the wrapped command exit code', function () {
+test('wrap mode propagates the wrapped command exit code (segment prepended)', function () {
   const dir = tmpDir();
   const r = runEntry({ session_id: 'e-exit', context_window: { used_percentage: 1 } },
     { CCT_DIR: dir, CCT_WRAP: "sh -c \"printf BAR; exit 7\"" });
-  assert.strictEqual(r.stdout, 'BAR');
-  assert.strictEqual(r.status, 7);
+  assert.strictEqual(r.stdout, 'ctx 1% BAR', 'segment prefix + wrapped bar');
+  assert.strictEqual(r.status, 7, 'wrapped exit code still propagates through exec');
 });
 
-test('wrap mode forwards the EXACT stdin payload to the wrapped command', function () {
+test('wrap mode forwards the EXACT stdin payload to the wrapped command (after the segment prefix)', function () {
   const dir = tmpDir();
   const payload = '{"session_id":"e-stdin","context_window":{"used_percentage":2,"context_window_size":200000},"x":"keep me"}';
+  // The wrapped command (cat) echoes its stdin. stdout = "<segment> " + that stdin, so
+  // the stdin invariant is asserted by requiring stdout to END WITH the exact payload.
   const r = runEntry(payload, { CCT_DIR: dir, CCT_WRAP: 'cat' });
-  assert.strictEqual(r.stdout, payload, 'wrapped command got the exact stdin');
+  assert.strictEqual(r.stdout, 'ctx 2% ' + payload, 'wrapped command got the exact stdin after the segment prefix');
+  assert.ok(r.stdout.endsWith(payload), 'stdout ends with the exact, unmodified payload');
 });
 
-test('wrap mode with a QUOTED path + args execs it directly (the adtention shape)', function () {
+test('wrap mode with a QUOTED path + args execs it directly (the adtention shape), segment prepended', function () {
   const dir = tmpDir();
   const prog = path.join(dir, 'my status.sh'); // space in path -> must stay quoted
   fs.writeFileSync(prog, '#!/bin/sh\nprintf "arg=%s;" "$1"\ncat\n');
   fs.chmodSync(prog, 0o755);
   const payload = '{"session_id":"e-args","context_window":{"used_percentage":4,"context_window_size":200000}}';
   const r = runEntry(payload, { CCT_DIR: dir, CCT_WRAP: "'" + prog + "' TOKEN" });
-  assert.strictEqual(r.stdout, 'arg=TOKEN;' + payload, 'quoted path honored, arg passed, exact stdin forwarded');
+  assert.strictEqual(r.stdout, 'ctx 4% arg=TOKEN;' + payload,
+    'segment prefix, then quoted path honored, arg passed, exact stdin forwarded');
+  assert.ok(r.stdout.endsWith(payload), 'exact payload forwarded on stdin (stdout ends with it)');
   process.env.CCT_DIR = dir;
   assert.strictEqual(api.readTelemetry('e-args').contextPct, 4, 'raw telemetry written');
   delete process.env.CCT_DIR;
+});
+
+// SEGMENT EXTRACTION (the bug class that cost a session): the awk objspan pass must read
+// context % from a REAL-shaped context_window that nests current_usage BEFORE
+// used_percentage, must NOT leak a sibling's value, and must never emit emoji.
+test('segment: REAL-shaped context_window nests current_usage BEFORE used_percentage -> correct ctx', function () {
+  const dir = tmpDir();
+  const r = runEntry({ session_id: 's-realshape',
+    context_window: { current_usage: { input_tokens: 123, cache_read_input_tokens: 45 },
+      used_percentage: 66.4, context_window_size: 200000 },
+    rate_limits: { five_hour: { used_percentage: 12 }, seven_day: { used_percentage: 30 } } }, { CCT_DIR: dir });
+  assert.strictEqual(r.stdout, 'ctx 66% | 5h 12% | 7d 30%',
+    'ctx read past the nested current_usage; not blank, not the nested value');
+  assert.ok(/^[\x20-\x7e]*$/.test(r.stdout), 'plain ASCII (no emoji)');
+});
+
+test('segment: NO-LEAK - context_window lacks used_percentage but rate_limits has one -> "ctx --", not the rate_limit value', function () {
+  const dir = tmpDir();
+  const r = runEntry({ session_id: 's-noleak',
+    context_window: { current_usage: { input_tokens: 1 }, context_window_size: 200000 },
+    rate_limits: { five_hour: { used_percentage: 77 } } }, { CCT_DIR: dir });
+  assert.strictEqual(r.stdout, 'ctx -- | 5h 77%',
+    'context % must NOT borrow the rate_limit value across the object boundary');
+});
+
+test('segment: 5h/7d come from rate_limits.five_hour / seven_day', function () {
+  const dir = tmpDir();
+  const r = runEntry({ session_id: 's-rl', context_window: { used_percentage: 10, context_window_size: 200000 },
+    rate_limits: { five_hour: { used_percentage: 40 }, seven_day: { used_percentage: 55 } } }, { CCT_DIR: dir });
+  assert.strictEqual(r.stdout, 'ctx 10% | 5h 40% | 7d 55%');
+});
+
+test('segment: null used_percentage -> "ctx --"', function () {
+  const dir = tmpDir();
+  const r = runEntry({ session_id: 's-segnull', context_window: { used_percentage: null, context_window_size: 200000 } }, { CCT_DIR: dir });
+  assert.strictEqual(r.stdout, 'ctx --');
+});
+
+test('segment: full combined "ctx X% | 5h Y% | 7d Z% <wrapped>" in WRAP mode', function () {
+  const dir = tmpDir();
+  const r = runEntry({ session_id: 's-segwrap',
+    context_window: { current_usage: { x: 1 }, used_percentage: 66.4, context_window_size: 200000 },
+    rate_limits: { five_hour: { used_percentage: 12 }, seven_day: { used_percentage: 30 } } },
+    { CCT_DIR: dir, CCT_WRAP: 'printf WRAPPED' });
+  assert.strictEqual(r.stdout, 'ctx 66% | 5h 12% | 7d 30% WRAPPED',
+    'combined segment prefix then the wrapped bar on the same line');
+  assert.ok(/^[\x20-\x7e]*$/.test(r.stdout), 'plain ASCII (no emoji)');
 });
 
 test('wrap mode that backgrounds (trailing &) does NOT hang the entry', function () {
