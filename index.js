@@ -130,6 +130,7 @@ module.exports = {
   writeTelemetry,
   telemetryDir,
   telemetryPath,
+  ensureDir,
   nowIso,
   DEFAULT_TTL_SEC,
 };

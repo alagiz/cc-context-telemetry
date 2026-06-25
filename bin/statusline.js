@@ -23,6 +23,7 @@
 //     straight from the payload (omit, never fabricate, what is absent).
 const { spawnSync } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 const tel = require('../index.js');
 
 // Read raw stdin ONCE and keep the exact string: we both parse it for telemetry
@@ -36,6 +37,30 @@ function parse(raw) {
 
 const raw = readStdin();
 const d = parse(raw);
+
+// OPT-IN raw payload dump. When env CCT_DEBUG is truthy, write the EXACT raw
+// stdin string (overwriting each call, so the file is always the latest real
+// payload) to <CCT_DIR>/debug-statusline.json. This lets a user inspect the real
+// statusline payload shape when telemetry comes back null. Best-effort ONLY:
+// wrapped in try/catch, never throws, never affects the bar output or exit code,
+// never blocks. Off by default - no file is written unless CCT_DEBUG is set.
+//
+// Truthiness: env vars are always non-empty strings, so a bare `if (env)` would
+// treat CCT_DEBUG=0 / false / off as ON. Treat "", "0", "false", "off", "no"
+// (case-insensitive, trimmed) as OFF; everything else (e.g. "1", "true", "yes")
+// is ON.
+function isTruthyEnv(v) {
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  if (s === '' || s === '0' || s === 'false' || s === 'off' || s === 'no') return false;
+  return true;
+}
+if (isTruthyEnv(process.env.CCT_DEBUG)) {
+  try {
+    tel.ensureDir();
+    fs.writeFileSync(path.join(tel.telemetryDir(), 'debug-statusline.json'), raw);
+  } catch (e) { /* debug dump is best-effort; never affect output */ }
+}
 
 // Parse the AUTHORITATIVE fields. context_window_size and used_percentage are
 // computed by Claude Code for the active model+plan; rate_limits is Pro/Max OAuth

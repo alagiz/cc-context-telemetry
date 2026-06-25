@@ -360,5 +360,59 @@ test('opts.ttlSec "" and negative fall back to default 120', function () {
   delete process.env.CCT_DIR;
 });
 
+// ---- CCT_DEBUG opt-in raw dump ----------------------------------------------
+
+test('CCT_DEBUG=1 dumps verbatim raw stdin to debug-statusline.json; bar still prints, exit 0', function () {
+  const dir = tmpDir();
+  // Use a raw string so we can assert the dump is byte-for-byte the stdin.
+  const rawPayload = '{"session_id":"s-dbg","context_window":{"used_percentage":12,"context_window_size":200000},"extra":"keep me"}';
+  const r = runWrapper(rawPayload, { CCT_DIR: dir, CCT_DEBUG: '1' });
+  assert.strictEqual(r.status, 0, 'exit 0 even with debug on');
+  assert.ok(/ctx 12%/.test(r.stdout), 'bar still prints');
+  const dumped = fs.readFileSync(path.join(dir, 'debug-statusline.json'), 'utf8');
+  assert.strictEqual(dumped, rawPayload, 'raw stdin dumped verbatim');
+});
+
+test('without CCT_DEBUG no debug file is written; bar still prints, exit 0', function () {
+  const dir = tmpDir();
+  const r = runWrapper({
+    session_id: 's-nodbg',
+    context_window: { used_percentage: 12, context_window_size: 200000 },
+  }, { CCT_DIR: dir });
+  assert.strictEqual(r.status, 0, 'exit 0');
+  assert.ok(/ctx 12%/.test(r.stdout), 'bar still prints');
+  assert.strictEqual(fs.existsSync(path.join(dir, 'debug-statusline.json')), false, 'no debug file written');
+});
+
+test('CCT_DEBUG falsey values (0, false) write NO debug file; "1" does', function () {
+  // CCT_DEBUG=0 -> OFF (no debug file).
+  const d0 = tmpDir();
+  runWrapper('{"session_id":"s-d0","context_window":{"used_percentage":1,"context_window_size":200000}}',
+    { CCT_DIR: d0, CCT_DEBUG: '0' });
+  assert.strictEqual(fs.existsSync(path.join(d0, 'debug-statusline.json')), false, 'CCT_DEBUG=0 -> no debug file');
+
+  // CCT_DEBUG=false -> OFF (no debug file).
+  const dF = tmpDir();
+  runWrapper('{"session_id":"s-dF","context_window":{"used_percentage":1,"context_window_size":200000}}',
+    { CCT_DIR: dF, CCT_DEBUG: 'false' });
+  assert.strictEqual(fs.existsSync(path.join(dF, 'debug-statusline.json')), false, 'CCT_DEBUG=false -> no debug file');
+
+  // CCT_DEBUG=1 -> ON (debug file written).
+  const d1 = tmpDir();
+  runWrapper('{"session_id":"s-d1","context_window":{"used_percentage":1,"context_window_size":200000}}',
+    { CCT_DIR: d1, CCT_DEBUG: '1' });
+  assert.strictEqual(fs.existsSync(path.join(d1, 'debug-statusline.json')), true, 'CCT_DEBUG=1 -> debug file written');
+});
+
+test('CCT_DEBUG overwrites debug-statusline.json with the latest payload', function () {
+  const dir = tmpDir();
+  const first = '{"session_id":"s-ovr","context_window":{"used_percentage":1,"context_window_size":200000}}';
+  const second = '{"session_id":"s-ovr","context_window":{"used_percentage":2,"context_window_size":200000}}';
+  runWrapper(first, { CCT_DIR: dir, CCT_DEBUG: '1' });
+  runWrapper(second, { CCT_DIR: dir, CCT_DEBUG: '1' });
+  const dumped = fs.readFileSync(path.join(dir, 'debug-statusline.json'), 'utf8');
+  assert.strictEqual(dumped, second, 'debug file holds only the latest payload');
+});
+
 console.log('\n' + pass + '/' + (pass + fail) + ' passed');
 process.exit(fail === 0 ? 0 : 1);

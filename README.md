@@ -124,6 +124,64 @@ compaction.
   5000). If it hangs, it is killed and the bar still prints.
 - `CCT_DIR` - telemetry directory (default `~/.claude/cc-context-telemetry/`).
 - `CCT_TTL_SEC` - freshness window for `readTelemetry` in seconds (default 120).
+- `CCT_DEBUG` - when set to a truthy value (e.g. `1`, `true`, `yes`), the wrapper
+  dumps the exact raw statusline stdin to `<CCT_DIR>/debug-statusline.json`,
+  overwriting it each call so it is always the latest real payload. The values
+  `0`, `false`, `off`, `no`, and an empty string (case-insensitive) count as OFF.
+  Off by default; best-effort (it never throws, never affects the bar or exit
+  code). Use it to inspect the real payload field paths when telemetry comes back
+  null. The dump may contain real session content, overwrites in place, and is
+  NOT auto-cleaned, so delete it when you are done.
+
+## Verify it works (one cheap session)
+
+The wrapper has been tested against stub payloads. To confirm it parses Claude
+Code's REAL statusline payload, one short session is enough (the statusline
+renders every turn, so there is no need to fill the context):
+
+1. Wire `bin/statusline.js` as your `statusLine` (see Wiring above) and set
+   `CCT_DEBUG=1` so the raw payload is also dumped. Add `CCT_WRAP` (your original
+   statusline command) so you keep your existing bar during the test. For example:
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "node /absolute/path/to/cc-context-telemetry/bin/statusline.js",
+       "env": {
+         "CCT_WRAP": "node /absolute/path/to/your/original-statusline.js",
+         "CCT_DEBUG": "1"
+       }
+     }
+   }
+   ```
+
+   (If your Claude Code version does not support an `env` block on `statusLine`,
+   export `CCT_WRAP` and `CCT_DEBUG=1` in your shell profile instead.) Without
+   `CCT_WRAP`, the minimal standalone `ctx ..%` bar REPLACES your existing bar for
+   the duration of the test; remove the test wiring (or set `CCT_WRAP`) to get it
+   back. Editing `settings.json` only takes effect in a FRESH session, so start a
+   new one after saving.
+
+2. Open any session and send ONE message. The statusline runs that turn.
+
+3. Check `~/.claude/cc-context-telemetry/telemetry-<session>.json` for sane
+   values: a numeric (or null) `context_pct`, a `context_window_size`, and a
+   `model`. Your session id is the `<session>` in that filename (the only
+   `telemetry-*.json` written this session), and it is also the `session_id`
+   field in any hook payload. You can also run
+   `node examples/print-telemetry.js <session-id>` to print it as pretty JSON.
+
+4. If the values are null or missing, inspect
+   `~/.claude/cc-context-telemetry/debug-statusline.json` (the verbatim raw
+   payload) to see the real field paths Claude Code sent.
+
+## Examples
+
+See the [`examples/`](examples/) directory for complete, runnable files: a
+copy-pasteable PreToolUse warning hook (`pretooluse-warn.js`) and a telemetry
+printer for the live check (`print-telemetry.js`). The examples are not shipped to
+npm.
 
 ## License
 
