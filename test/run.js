@@ -1,8 +1,17 @@
 'use strict';
-// Bounded test runner for cc-context-telemetry (exec model). Zero deps, home-grown.
+// Bounded test runner for cc-context-telemetry (PURE-SHELL entry + on-demand reader).
 // Every test uses a temp CCT_DIR so the real telemetry dir is never touched. Nothing
 // here calls `claude` or scans a binary; spawned children are tiny inline node/sh
 // stubs, all bounded by short timeouts and cleaned up (no leaked processes).
+//
+// ARCHITECTURE UNDER TEST:
+//   bin/cct-statusline  - PURE SHELL. Per render: reads stdin, extracts+sanitizes the
+//                         session_id, ATOMICALLY writes the RAW payload to
+//                         telemetry-raw-<sid>.json, then EITHER execs CCT_WRAP OR
+//                         prints a minimal shell-extracted bar. NO Node on this path.
+//   index.js            - readTelemetry(sid): reads + parses the raw file ON DEMAND,
+//                         prunes stale/excess raw files (throttled, off the hot path).
+//   bin/telemetry.js    - on-demand CLI READER over readTelemetry (NOT in hot path).
 const assert = require('assert');
 const { spawnSync } = require('child_process');
 const fs = require('fs');
@@ -10,8 +19,8 @@ const os = require('os');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
-const ENTRY = path.join(ROOT, 'bin', 'cct-statusline');   // the shell entry (execs CCT_WRAP)
-const TELEMETRY = path.join(ROOT, 'bin', 'telemetry.js');  // the telemetry-only writer
+const ENTRY = path.join(ROOT, 'bin', 'cct-statusline');   // the pure-shell entry
+const READER = path.join(ROOT, 'bin', 'telemetry.js');    // the on-demand CLI reader
 
 let pass = 0, fail = 0;
 function test(name, fn) {
@@ -19,9 +28,9 @@ function test(name, fn) {
   catch (e) { fail++; console.log('FAIL - ' + name + '\n       ' + (e && e.message)); }
 }
 function tmpDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'cct-test-')); }
-function sleepSync(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 
-// Run the shell ENTRY with a stub payload on stdin and the given env. Bounded.
+// Run the shell ENTRY with a stub payload on stdin (which CLOSES, as Claude Code
+// does) and the given env. Bounded by a short timeout.
 function runEntry(payload, env) {
   return spawnSync('/bin/sh', [ENTRY], {
     input: typeof payload === 'string' ? payload : JSON.stringify(payload),
@@ -29,168 +38,235 @@ function runEntry(payload, env) {
     env: Object.assign({}, process.env, env),
   });
 }
-// Run the telemetry-only writer directly.
-function runTelemetry(payload, env) {
-  return spawnSync(process.execPath, [TELEMETRY], {
-    input: typeof payload === 'string' ? payload : JSON.stringify(payload),
+// Run the on-demand CLI reader.
+function runReader(args, env, input) {
+  return spawnSync(process.execPath, [READER].concat(args || []), {
+    input: input,
     encoding: 'utf8', timeout: 10000,
     env: Object.assign({}, process.env, env),
   });
 }
-function readTelFile(dir, sessionId) {
-  return JSON.parse(fs.readFileSync(path.join(dir, 'telemetry-' + sessionId + '.json'), 'utf8'));
+// Read the RAW per-session payload file the entry wrote.
+function rawFile(dir, sid) {
+  return fs.readFileSync(path.join(dir, 'telemetry-raw-' + sid + '.json'), 'utf8');
 }
 const api = require('../index.js');
 
-// ---- telemetry writer: field mapping -------------------------------------------
+// ============================================================================
+// (1) RAW WRITE: the entry writes telemetry-raw-<sid>.json verbatim, atomically
+// ============================================================================
 
-test('Pro/Max payload (rate_limits + 200k window) writes full telemetry', function () {
+test('entry writes the RAW payload verbatim to telemetry-raw-<sid>.json', function () {
   const dir = tmpDir();
-  const r = runTelemetry({
-    session_id: 's-pro',
-    context_window: { used_percentage: 47.2, context_window_size: 200000 },
-    rate_limits: { five_hour: { used_percentage: 12 }, seven_day: { used_percentage: 30 } },
-    model: { id: 'claude-opus-4-1' },
-  }, { CCT_DIR: dir });
+  const payload = '{"session_id":"s-raw","context_window":{"used_percentage":47.2,"context_window_size":200000},"extra":"keep me"}';
+  const r = runEntry(payload, { CCT_DIR: dir });
   assert.strictEqual(r.status, 0);
-  const t = readTelFile(dir, 's-pro');
-  assert.strictEqual(t.context_pct, 47.2);
-  assert.strictEqual(t.context_window_size, 200000);
-  assert.strictEqual(t.five_hour_pct, 12);
-  assert.strictEqual(t.seven_day_pct, 30);
+  assert.strictEqual(rawFile(dir, 's-raw'), payload, 'raw file is byte-identical to stdin');
+});
+
+test('atomic write leaves NO leftover .tmp files in the dir', function () {
+  const dir = tmpDir();
+  runEntry('{"session_id":"s-tmp","context_window":{"used_percentage":1}}', { CCT_DIR: dir });
+  const files = fs.readdirSync(dir);
+  assert.ok(files.every(function (f) { return f.slice(-4) !== '.tmp'; }),
+    'no .tmp litter: ' + JSON.stringify(files));
+  assert.deepStrictEqual(files, ['telemetry-raw-s-tmp.json']);
+});
+
+// ============================================================================
+// (2) ON-DEMAND PARSE round-trip across payload shapes (full / null / missing /
+//     malformed) via the entry + index.js readTelemetry
+// ============================================================================
+
+test('round-trip FULL Pro/Max payload (rate_limits + 200k window)', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  runEntry({ session_id: 's-pro', context_window: { used_percentage: 47.2, context_window_size: 200000 },
+    rate_limits: { five_hour: { used_percentage: 12 }, seven_day: { used_percentage: 30 } },
+    model: { id: 'claude-opus-4-1' } }, { CCT_DIR: dir });
+  const t = api.readTelemetry('s-pro');
+  assert.ok(t);
+  assert.strictEqual(t.contextPct, 47.2);
+  assert.strictEqual(t.usedPercentage, 47.2);
+  assert.strictEqual(t.windowSize, 200000);
+  assert.strictEqual(t.fiveHourPct, 12);
+  assert.strictEqual(t.sevenDayPct, 30);
   assert.strictEqual(t.model, 'claude-opus-4-1');
   assert.strictEqual(t.source, 'statusline');
+  assert.strictEqual(t.fresh, true, 'a just-written raw file is fresh');
+  delete process.env.CCT_DIR;
 });
 
-test('Max + 1M window writes the large window size', function () {
-  const dir = tmpDir();
-  runTelemetry({ session_id: 's-1m', context_window: { used_percentage: 10, context_window_size: 1000000 },
+test('round-trip 1M window', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  runEntry({ session_id: 's-1m', context_window: { used_percentage: 10, context_window_size: 1000000 },
     rate_limits: { five_hour: { used_percentage: 5 } }, model: { id: 'claude-sonnet-4-5' } }, { CCT_DIR: dir });
-  const t = readTelFile(dir, 's-1m');
-  assert.strictEqual(t.context_window_size, 1000000);
-  assert.strictEqual(t.five_hour_pct, 5);
+  const t = api.readTelemetry('s-1m');
+  assert.strictEqual(t.windowSize, 1000000);
+  assert.strictEqual(t.fiveHourPct, 5);
+  assert.strictEqual(t.sevenDayPct, undefined, '7d omitted when absent');
+  delete process.env.CCT_DIR;
 });
 
-test('API-key payload WITHOUT rate_limits omits 5h/7d (never 0)', function () {
-  const dir = tmpDir();
-  runTelemetry({ session_id: 's-api', context_window: { used_percentage: 60, context_window_size: 200000 },
+test('round-trip API-key payload WITHOUT rate_limits omits 5h/7d (never 0)', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  runEntry({ session_id: 's-api', context_window: { used_percentage: 60, context_window_size: 200000 },
     model: { id: 'claude-opus-4-1' } }, { CCT_DIR: dir });
-  const t = readTelFile(dir, 's-api');
-  assert.strictEqual(Object.prototype.hasOwnProperty.call(t, 'five_hour_pct'), false);
-  assert.strictEqual(Object.prototype.hasOwnProperty.call(t, 'seven_day_pct'), false);
-  assert.strictEqual(t.context_pct, 60);
+  const t = api.readTelemetry('s-api');
+  assert.strictEqual(t.fiveHourPct, undefined);
+  assert.strictEqual(t.sevenDayPct, undefined);
+  assert.strictEqual(t.contextPct, 60);
+  delete process.env.CCT_DIR;
 });
 
-test('used_percentage null -> context_pct null', function () {
-  const dir = tmpDir();
-  runTelemetry({ session_id: 's-null', context_window: { used_percentage: null, context_window_size: 200000 } }, { CCT_DIR: dir });
-  assert.strictEqual(readTelFile(dir, 's-null').context_pct, null);
+test('round-trip used_percentage null -> contextPct null, NOT fresh', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  runEntry({ session_id: 's-null', context_window: { used_percentage: null, context_window_size: 200000 } }, { CCT_DIR: dir });
+  const t = api.readTelemetry('s-null');
+  assert.strictEqual(t.contextPct, null);
+  assert.strictEqual(t.fresh, false, 'null context is never fresh');
+  delete process.env.CCT_DIR;
 });
 
-// ---- telemetry writer: bar printing only in standalone -------------------------
+test('round-trip MALFORMED payload -> raw file written, readTelemetry returns null (no throw)', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  // No session_id in malformed text -> entry falls back to "default" (matching the JS
+  // sanitizeId empty-id fallback, so a reader resolves the same filename).
+  runEntry('not json at all <<<', { CCT_DIR: dir });
+  assert.ok(fs.existsSync(path.join(dir, 'telemetry-raw-default.json')), 'raw still written');
+  let threw = false, t;
+  try { t = api.readTelemetry(''); } catch (e) { threw = true; }
+  assert.strictEqual(threw, false, 'never throws on bad JSON');
+  assert.strictEqual(t, null, 'unparseable raw -> null');
+  delete process.env.CCT_DIR;
+});
 
-test('telemetry writer STANDALONE (no CCT_WRAP) prints the minimal bar', function () {
+test('round-trip EMPTY stdin -> raw file empty, readTelemetry null', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  runEntry('', { CCT_DIR: dir });
+  // shell empty-id fallback "default" matches JS sanitizeId('') -> "default".
+  assert.strictEqual(api.readTelemetry(''), null);
+  assert.ok(fs.existsSync(path.join(dir, 'telemetry-raw-default.json')), 'written under default');
+  delete process.env.CCT_DIR;
+});
+
+test('round-trip partial payload (only session_id) -> contextPct null, fields null/omitted', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  runEntry({ session_id: 's-partial' }, { CCT_DIR: dir });
+  const t = api.readTelemetry('s-partial');
+  assert.ok(t);
+  assert.strictEqual(t.contextPct, null);
+  assert.strictEqual(t.windowSize, null);
+  assert.strictEqual(t.model, null);
+  assert.strictEqual(t.fiveHourPct, undefined);
+  delete process.env.CCT_DIR;
+});
+
+// ============================================================================
+// (3) STANDALONE shell bar extraction (incl. NO emoji)
+// ============================================================================
+
+test('standalone bar: ctx + 5h + 7d, rounded, no emoji', function () {
   const dir = tmpDir();
-  const r = runTelemetry({ session_id: 's-stand', context_window: { used_percentage: 33, context_window_size: 200000 },
+  const r = runEntry({ session_id: 's-bar', context_window: { used_percentage: 33.4 },
     rate_limits: { five_hour: { used_percentage: 9 }, seven_day: { used_percentage: 21 } } }, { CCT_DIR: dir });
-  assert.ok(/ctx 33%/.test(r.stdout), 'ctx in bar');
-  assert.ok(/5h 9%/.test(r.stdout) && /7d 21%/.test(r.stdout), 'usage in bar');
   assert.strictEqual(r.status, 0);
+  assert.strictEqual(r.stdout, 'ctx 33% | 5h 9% | 7d 21%');
+  // No emoji: every byte is ASCII printable.
+  assert.ok(/^[\x20-\x7e]*$/.test(r.stdout), 'bar is plain ASCII (no emoji)');
 });
 
-test('telemetry writer WRAP mode (CCT_WRAP set) prints NOTHING (exec prints the bar)', function () {
+test('standalone bar: ctx rounds 47.6 -> 48', function () {
   const dir = tmpDir();
-  const r = runTelemetry({ session_id: 's-quiet', context_window: { used_percentage: 33, context_window_size: 200000 } },
-    { CCT_DIR: dir, CCT_WRAP: "printf 'X'" });
-  assert.strictEqual(r.stdout, '', 'no bar printed in wrap mode');
-  assert.strictEqual(readTelFile(dir, 's-quiet').context_pct, 33, 'telemetry still written');
+  const r = runEntry({ session_id: 's-rnd', context_window: { used_percentage: 47.6 } }, { CCT_DIR: dir });
+  assert.strictEqual(r.stdout, 'ctx 48%');
 });
 
-test('telemetry writer NEVER spawns a child (no lingering process)', function () {
-  // It only reads stdin + writes a file; assert it returns promptly with no children.
+test('standalone bar: null used_percentage -> "ctx --"', function () {
   const dir = tmpDir();
-  const start = Date.now();
-  const r = runTelemetry({ session_id: 's-fast', context_window: { used_percentage: 1, context_window_size: 200000 } }, { CCT_DIR: dir });
-  assert.strictEqual(r.status, 0);
-  assert.ok(Date.now() - start < 8000, 'returns promptly');
+  const r = runEntry({ session_id: 's-bn', context_window: { used_percentage: null } }, { CCT_DIR: dir });
+  assert.strictEqual(r.stdout, 'ctx --');
 });
 
-// ---- shell entry: standalone + wrap pass-through -------------------------------
-
-test('entry STANDALONE prints minimal bar AND writes telemetry', function () {
+test('standalone bar: ctx present, NO rate_limits -> only ctx segment', function () {
   const dir = tmpDir();
-  const r = runEntry({ session_id: 'e-stand', context_window: { used_percentage: 12, context_window_size: 200000 } },
-    { CCT_DIR: dir, CCT_NODE: process.execPath });
-  assert.strictEqual(r.status, 0);
-  assert.ok(/ctx 12%/.test(r.stdout), 'bar printed');
-  assert.strictEqual(readTelFile(dir, 'e-stand').context_pct, 12);
+  const r = runEntry({ session_id: 's-bo', context_window: { used_percentage: 60, context_window_size: 200000 } }, { CCT_DIR: dir });
+  assert.strictEqual(r.stdout, 'ctx 60%');
 });
 
-test('entry WRAP mode EXECs CCT_WRAP, prints ITS bar verbatim, still writes telemetry', function () {
+test('standalone bar: object scoping - rate_limits has pct but context_window does NOT (no leak)', function () {
   const dir = tmpDir();
+  const r = runEntry({ session_id: 's-scope', context_window: { context_window_size: 200000 },
+    rate_limits: { five_hour: { used_percentage: 99 } } }, { CCT_DIR: dir });
+  assert.strictEqual(r.stdout, 'ctx -- | 5h 99%', 'context % must not borrow the rate_limit value');
+});
+
+test('standalone bar: malformed/empty stdin -> "ctx --", exit 0', function () {
+  const dir = tmpDir();
+  assert.strictEqual(runEntry('not json {', { CCT_DIR: dir }).stdout, 'ctx --');
+  assert.strictEqual(runEntry('', { CCT_DIR: dir }).stdout, 'ctx --');
+});
+
+// ============================================================================
+// (4) WRAP-MODE exec passthrough
+// ============================================================================
+
+test('wrap mode EXECs CCT_WRAP, prints ITS bar verbatim, still writes raw telemetry', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
   const r = runEntry({ session_id: 'e-wrap', context_window: { used_percentage: 5, context_window_size: 200000 } },
-    { CCT_DIR: dir, CCT_NODE: process.execPath, CCT_WRAP: "printf 'MY-REAL-BAR'" });
+    { CCT_DIR: dir, CCT_WRAP: "printf 'MY-REAL-BAR'" });
   assert.strictEqual(r.stdout, 'MY-REAL-BAR', 'verbatim wrapped output');
   assert.strictEqual(r.status, 0);
-  assert.strictEqual(readTelFile(dir, 'e-wrap').context_pct, 5, 'telemetry written under wrap');
+  assert.strictEqual(api.readTelemetry('e-wrap').contextPct, 5, 'raw telemetry written under wrap');
+  delete process.env.CCT_DIR;
 });
 
-test('entry WRAP mode propagates the wrapped command exit code', function () {
+test('wrap mode propagates the wrapped command exit code', function () {
   const dir = tmpDir();
-  const r = runEntry({ session_id: 'e-exit', context_window: { used_percentage: 1, context_window_size: 200000 } },
-    { CCT_DIR: dir, CCT_NODE: process.execPath, CCT_WRAP: "sh -c \"printf BAR; exit 7\"" });
+  const r = runEntry({ session_id: 'e-exit', context_window: { used_percentage: 1 } },
+    { CCT_DIR: dir, CCT_WRAP: "sh -c \"printf BAR; exit 7\"" });
   assert.strictEqual(r.stdout, 'BAR');
-  assert.strictEqual(r.status, 7, 'exec propagates the wrapped exit code');
+  assert.strictEqual(r.status, 7);
 });
 
-test('entry WRAP mode receives the EXACT stdin payload', function () {
+test('wrap mode forwards the EXACT stdin payload to the wrapped command', function () {
   const dir = tmpDir();
-  // The wrapped command echoes its stdin; assert it is byte-identical to what we sent.
   const payload = '{"session_id":"e-stdin","context_window":{"used_percentage":2,"context_window_size":200000},"x":"keep me"}';
-  const r = runEntry(payload, { CCT_DIR: dir, CCT_NODE: process.execPath, CCT_WRAP: 'cat' });
+  const r = runEntry(payload, { CCT_DIR: dir, CCT_WRAP: 'cat' });
   assert.strictEqual(r.stdout, payload, 'wrapped command got the exact stdin');
 });
 
-test('entry WRAP with a QUOTED path + args execs it directly with args + exact stdin (the adtention shape)', function () {
-  // The real-world CCT_WRAP is a quoted program path plus args, e.g.
-  // "'/path/to/adtention' status". Assert the quoting is honored (arg passed), the
-  // program is exec'd, and it still receives the exact payload on stdin.
+test('wrap mode with a QUOTED path + args execs it directly (the adtention shape)', function () {
   const dir = tmpDir();
-  const prog = path.join(dir, 'my status.sh'); // space in the path -> must stay quoted
+  const prog = path.join(dir, 'my status.sh'); // space in path -> must stay quoted
   fs.writeFileSync(prog, '#!/bin/sh\nprintf "arg=%s;" "$1"\ncat\n');
   fs.chmodSync(prog, 0o755);
   const payload = '{"session_id":"e-args","context_window":{"used_percentage":4,"context_window_size":200000}}';
-  const r = runEntry(payload, { CCT_DIR: dir, CCT_NODE: process.execPath, CCT_WRAP: "'" + prog + "' TOKEN" });
+  const r = runEntry(payload, { CCT_DIR: dir, CCT_WRAP: "'" + prog + "' TOKEN" });
   assert.strictEqual(r.stdout, 'arg=TOKEN;' + payload, 'quoted path honored, arg passed, exact stdin forwarded');
-  assert.strictEqual(readTelFile(dir, 'e-args').context_pct, 4, 'telemetry written');
+  process.env.CCT_DIR = dir;
+  assert.strictEqual(api.readTelemetry('e-args').contextPct, 4, 'raw telemetry written');
+  delete process.env.CCT_DIR;
 });
 
-test('entry WRAP that backgrounds (trailing &) does NOT hang the entry (no stuck wrapper)', function () {
-  // A trailing & is a misuse (it backgrounds the statusline, same as running it
-  // directly), but it must not HANG our entry. Bounded: assert the entry returns.
+test('wrap mode that backgrounds (trailing &) does NOT hang the entry', function () {
   const dir = tmpDir();
-  // Use a SHORT-lived background process (sleep 1) so it self-cleans - no broad pkill
-  // that could hit unrelated processes.
-  const r = runEntry({ session_id: 'e-bg', context_window: { used_percentage: 1, context_window_size: 200000 } },
-    { CCT_DIR: dir, CCT_NODE: process.execPath, CCT_WRAP: "printf BG; sleep 1 &" });
-  // spawnSync returns when the entry exits; a hang would hit the 10s timeout (status null).
+  const r = runEntry({ session_id: 'e-bg', context_window: { used_percentage: 1 } },
+    { CCT_DIR: dir, CCT_WRAP: "printf BG; sleep 1 &" });
   assert.strictEqual(r.signal, null, 'entry was not killed by the test timeout (did not hang)');
 });
 
-// ---- shell entry: the no-leak regression (the fork-bomb fix) --------------------
+// ============================================================================
+// (5) REGRESSION: exec (not spawn) - killing the entry tears down the wrapped
+//     command. NOTHING orphans. (The pile-up fix, in a shell harness.)
+// ============================================================================
 
-test('REGRESSION: entry EXECs (does not spawn) the wrapped command - killing the entry kills it, no leak', function () {
-  // A wrapped command that records its pid then sleeps. Under the OLD spawn model the
+test('REGRESSION: killing the entry kills the EXECd wrapped command - no leak', function () {
+  // A wrapped command records its pid then sleeps. Under the OLD spawn model the
   // wrapper spawned this DETACHED, so killing the wrapper (as Claude Code does every
   // render) left it alive -> a per-render pile-up. The exec model makes the wrapped
-  // command BE the process, so killing the entry kills it.
-  //
-  // The liveness check runs in a SHELL harness, not the Node test process: a shell
-  // reaps its killed jobs cleanly, whereas this suite's blocking Atomics.wait poll
-  // would stall Node's event loop, leave the killed child as an unreaped ZOMBIE, and
-  // process.kill(pid,0) reports a zombie as "alive" (a false leak). The shell `kill -0`
-  // correctly reports a reaped/dead pid as gone. (This is the same harness shape that
-  // proved direct==exec safe and spawn unsafe.)
+  // command BE the process, so killing the entry kills it. The liveness check runs in
+  // a SHELL harness (shell reaps killed jobs cleanly; a Node poll would see a zombie
+  // as "alive", a false leak).
   const dir = tmpDir();
   const pidfile = path.join(dir, 'wrapped.pid');
   const heavy = path.join(dir, 'heavy.sh');
@@ -200,115 +276,239 @@ test('REGRESSION: entry EXECs (does not spawn) the wrapped command - killing the
   fs.writeFileSync(payloadFile, '{"session_id":"e-leak","context_window":{"used_percentage":1,"context_window_size":200000}}');
   fs.writeFileSync(harness,
     '#!/bin/sh\n' +
-    'CCT_WRAP="' + heavy + '" CCT_DIR="' + dir + '" CCT_NODE="' + process.execPath + '" ' +
+    'CCT_WRAP="' + heavy + '" CCT_DIR="' + dir + '" ' +
       '/bin/sh "' + ENTRY + '" < "' + payloadFile + '" >/dev/null 2>&1 &\n' +
     'sp=$!\n' +
-    'sleep 1\n' +                                  // let it write telemetry + exec heavy (-> exec sleep)
-    'kill -9 "$sp" 2>/dev/null\n' +                // simulate Claude Code killing the statusline process
+    'sleep 1\n' +                                  // let it write telemetry + exec heavy
+    'kill -9 "$sp" 2>/dev/null\n' +                // simulate Claude Code killing the statusline
     'sleep 1\n' +
     'hp=$(cat "' + pidfile + '" 2>/dev/null)\n' +
     'if [ -n "$hp" ] && kill -0 "$hp" 2>/dev/null; then echo LEAK; else echo OK; fi\n' +
-    '[ -n "$hp" ] && kill -9 "$hp" 2>/dev/null\n' +  // belt-and-suspenders: never leak
+    '[ -n "$hp" ] && kill -9 "$hp" 2>/dev/null\n' +  // belt-and-suspenders cleanup
     'exit 0\n');
   const r = spawnSync('/bin/sh', [harness], { encoding: 'utf8', timeout: 15000 });
-  assert.ok(/\bOK\b/.test(r.stdout || ''), 'wrapped command torn down with the entry (NO leak); harness said: ' + JSON.stringify(r.stdout));
+  assert.ok(/\bOK\b/.test(r.stdout || ''), 'wrapped command torn down with the entry (NO leak); said: ' + JSON.stringify(r.stdout));
 });
 
-// ---- malformed / empty stdin ---------------------------------------------------
+// ============================================================================
+// (6) SESSION_ID SANITIZATION: a hostile id cannot escape the dir (entry + api)
+// ============================================================================
 
-test('entry: non-JSON stdin -> telemetry null, bar "ctx --", exit 0', function () {
+test('entry: hostile session_id "../../etc/evil" cannot escape CCT_DIR', function () {
   const dir = tmpDir();
-  const r = runEntry('not json {', { CCT_DIR: dir, CCT_NODE: process.execPath });
-  assert.strictEqual(r.status, 0);
-  assert.ok(/ctx --/.test(r.stdout));
-  assert.strictEqual(readTelFile(dir, 'default').context_pct, null);
+  const escaped = path.resolve(dir, '..', '..', 'etc', 'evil.json');
+  runEntry('{"session_id":"../../etc/evil","context_window":{"used_percentage":5}}', { CCT_DIR: dir });
+  assert.strictEqual(fs.existsSync(escaped), false, 'no file outside the dir');
+  const files = fs.readdirSync(dir);
+  assert.strictEqual(files.length, 1, 'exactly one raw file');
+  assert.ok(/^telemetry-raw-[A-Za-z0-9_-]+\.json$/.test(files[0]), 'sanitized name: ' + files[0]);
+  assert.strictEqual(files[0].indexOf('/'), -1, 'no path separator in the name');
 });
 
-test('entry: empty stdin -> telemetry null, bar "ctx --", exit 0', function () {
+test('entry: slashed session_id "a/b/c" creates no nested dirs', function () {
   const dir = tmpDir();
-  const r = runEntry('', { CCT_DIR: dir, CCT_NODE: process.execPath });
-  assert.strictEqual(r.status, 0);
-  assert.ok(/ctx --/.test(r.stdout));
+  runEntry('{"session_id":"a/b/c","context_window":{"used_percentage":1}}', { CCT_DIR: dir });
+  assert.strictEqual(fs.existsSync(path.join(dir, 'a')), false, 'no nested dir');
+  assert.strictEqual(fs.readdirSync(dir).length, 1);
 });
 
-// ---- readTelemetry freshness (index.js) ----------------------------------------
-
-test('readTelemetry returns null when the file is absent', function () {
+test('entry + api agree on the sanitized id for the SAME hostile input (round-trip)', function () {
   const dir = tmpDir(); process.env.CCT_DIR = dir;
-  assert.strictEqual(api.readTelemetry('nope'), null);
-  delete process.env.CCT_DIR;
-});
-test('readTelemetry fresh for a recent ts', function () {
-  const dir = tmpDir(); process.env.CCT_DIR = dir;
-  api.writeTelemetry('s-fresh', { session_id: 's-fresh', context_pct: 42, used_percentage: 42,
-    context_window_size: 200000, model: 'm', ts: new Date().toISOString(), source: 'statusline' });
-  const t = api.readTelemetry('s-fresh');
-  assert.ok(t); assert.strictEqual(t.fresh, true); assert.strictEqual(t.contextPct, 42);
-  delete process.env.CCT_DIR;
-});
-test('readTelemetry NOT fresh for a stale ts', function () {
-  const dir = tmpDir(); process.env.CCT_DIR = dir;
-  api.writeTelemetry('s-stale', { session_id: 's-stale', context_pct: 42,
-    ts: new Date(Date.now() - 10 * 60 * 1000).toISOString(), source: 'statusline' });
-  assert.strictEqual(api.readTelemetry('s-stale').fresh, false);
-  delete process.env.CCT_DIR;
-});
-test('readTelemetry NOT fresh for a far-future ts', function () {
-  const dir = tmpDir(); process.env.CCT_DIR = dir;
-  api.writeTelemetry('s-future', { session_id: 's-future', context_pct: 42,
-    ts: new Date(Date.now() + 10 * 60 * 1000).toISOString(), source: 'statusline' });
-  assert.strictEqual(api.readTelemetry('s-future').fresh, false);
-  delete process.env.CCT_DIR;
-});
-test('readTelemetry NOT fresh when context_pct is null even with recent ts', function () {
-  const dir = tmpDir(); process.env.CCT_DIR = dir;
-  api.writeTelemetry('s-noctx', { session_id: 's-noctx', context_pct: null, ts: new Date().toISOString(), source: 'statusline' });
-  const t = api.readTelemetry('s-noctx');
-  assert.strictEqual(t.fresh, false); assert.strictEqual(t.contextPct, null);
-  delete process.env.CCT_DIR;
-});
-test('opts.ttlSec overrides the default TTL', function () {
-  const dir = tmpDir(); process.env.CCT_DIR = dir;
-  api.writeTelemetry('s-ttl', { session_id: 's-ttl', context_pct: 1, ts: new Date(Date.now() - 50 * 1000).toISOString(), source: 'statusline' });
-  assert.strictEqual(api.readTelemetry('s-ttl', { ttlSec: 30 }).fresh, false);
-  assert.strictEqual(api.readTelemetry('s-ttl', { ttlSec: 120 }).fresh, true);
+  // Write via entry with a hostile id, then read it back via the api with the SAME
+  // raw id: both must sanitize identically or the read would miss the file.
+  runEntry('{"session_id":"a/b/c","context_window":{"used_percentage":7,"context_window_size":200000}}', { CCT_DIR: dir });
+  const t = api.readTelemetry('a/b/c');
+  assert.ok(t, 'entry and api sanitize the id identically');
+  assert.strictEqual(t.contextPct, 7);
   delete process.env.CCT_DIR;
 });
 
-// ---- path traversal containment (index.js) -------------------------------------
+test('entry no-session-id write is readable via the JS empty-id fallback (both -> "default")', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  // Entry writes with NO session_id -> "default"; a hook reading with an empty/absent
+  // id (JS sanitizeId -> "default") must resolve the SAME file, not miss it.
+  runEntry('{"context_window":{"used_percentage":50,"context_window_size":200000}}', { CCT_DIR: dir });
+  const t = api.readTelemetry('');
+  assert.ok(t, 'shell "default" and JS "default" agree');
+  assert.strictEqual(t.contextPct, 50);
+  delete process.env.CCT_DIR;
+});
 
-test('writeTelemetry with a "../../tmp/evil" id stays INSIDE CCT_DIR', function () {
+test('api: empty session_id -> "default", hostile id contained (writeTelemetry path)', function () {
   const dir = tmpDir(); process.env.CCT_DIR = dir;
   const escaped = path.resolve(os.tmpdir(), 'evil.json');
   try { fs.unlinkSync(escaped); } catch (e) {}
   api.writeTelemetry('../../tmp/evil', { session_id: 'x', context_pct: 1, ts: api.nowIso() });
   assert.strictEqual(fs.existsSync(escaped), false);
   assert.strictEqual(api.readTelemetry('../../tmp/evil').contextPct, 1);
-  const files = fs.readdirSync(dir);
-  assert.strictEqual(files.length, 1);
-  assert.ok(/^telemetry-.*\.json$/.test(files[0]));
-  delete process.env.CCT_DIR;
-});
-test('writeTelemetry with a slashed id ("a/b/c") cannot create nested dirs', function () {
-  const dir = tmpDir(); process.env.CCT_DIR = dir;
-  api.writeTelemetry('a/b/c', { session_id: 'x', context_pct: 9, ts: api.nowIso() });
-  assert.strictEqual(fs.existsSync(path.join(dir, 'a')), false);
-  assert.strictEqual(fs.readdirSync(dir).length, 1);
-  assert.strictEqual(api.readTelemetry('a/b/c').contextPct, 9);
   delete process.env.CCT_DIR;
 });
 
-// ---- readTelemetry on garbage / TTL validation ---------------------------------
+// ============================================================================
+// (7) PRUNING (off the hot path, on the reader side)
+// ============================================================================
 
-test('readTelemetry on a non-JSON file returns null, does not throw', function () {
+test('pruneRaw deletes raw files older than the age cutoff, keeps fresh ones', function () {
   const dir = tmpDir(); process.env.CCT_DIR = dir;
-  fs.writeFileSync(api.telemetryPath('s-garbage'), 'not json at all <<<');
-  let result, threw = false;
-  try { result = api.readTelemetry('s-garbage'); } catch (e) { threw = true; }
-  assert.strictEqual(threw, false); assert.strictEqual(result, null);
+  api.ensureDir();
+  const old = path.join(dir, 'telemetry-raw-old.json');
+  const fresh = path.join(dir, 'telemetry-raw-fresh.json');
+  fs.writeFileSync(old, '{}');
+  fs.writeFileSync(fresh, '{}');
+  // Backdate `old` two days; default age cutoff is 1 day.
+  const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(old, twoDaysAgo, twoDaysAgo);
+  api.pruneRaw();
+  assert.strictEqual(fs.existsSync(old), false, 'stale raw file pruned');
+  assert.strictEqual(fs.existsSync(fresh), true, 'fresh raw file kept');
   delete process.env.CCT_DIR;
 });
-test('CCT_TTL_SEC="" / negative fall back to default 120', function () {
+
+test('pruneRaw enforces the count cap, deleting the OLDEST first', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  process.env.CCT_PRUNE_MAX_FILES = '3';
+  api.ensureDir();
+  // 5 fresh raw files with staggered mtimes (i seconds ago); cap is 3 -> 2 oldest go.
+  const base = Date.now();
+  for (let i = 0; i < 5; i++) {
+    const p = path.join(dir, 'telemetry-raw-s' + i + '.json');
+    fs.writeFileSync(p, '{}');
+    const t = (base - i * 1000) / 1000; // s0 newest, s4 oldest
+    fs.utimesSync(p, t, t);
+  }
+  api.pruneRaw();
+  const left = fs.readdirSync(dir).filter(function (f) { return f.indexOf('telemetry-raw-') === 0; }).sort();
+  assert.strictEqual(left.length, 3, 'capped to 3');
+  // s0,s1,s2 are newest -> kept; s3,s4 oldest -> pruned.
+  assert.deepStrictEqual(left, ['telemetry-raw-s0.json', 'telemetry-raw-s1.json', 'telemetry-raw-s2.json']);
+  delete process.env.CCT_PRUNE_MAX_FILES; delete process.env.CCT_DIR;
+});
+
+test('pruneRaw reclaims a STALE atomic-write .tmp leftover, keeps a fresh one', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  api.ensureDir();
+  const staleTmp = path.join(dir, '.telemetry-raw-s.12345.tmp');
+  const freshTmp = path.join(dir, '.telemetry-raw-s.67890.tmp');
+  fs.writeFileSync(staleTmp, '{}');
+  fs.writeFileSync(freshTmp, '{}');
+  const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(staleTmp, twoDaysAgo, twoDaysAgo);
+  api.pruneRaw();
+  assert.strictEqual(fs.existsSync(staleTmp), false, 'stale crash-leftover .tmp reclaimed');
+  assert.strictEqual(fs.existsSync(freshTmp), true, 'in-flight .tmp (fresh) NOT touched');
+  delete process.env.CCT_DIR;
+});
+
+test('pruneRaw only touches telemetry-raw-* files, never others', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  api.ensureDir();
+  const other = path.join(dir, 'unrelated.json');
+  const legacy = path.join(dir, 'telemetry-s.json'); // legacy parsed file, NOT a raw file
+  const raw = path.join(dir, 'telemetry-raw-x.json');
+  fs.writeFileSync(other, 'keep');
+  fs.writeFileSync(legacy, 'keep');
+  fs.writeFileSync(raw, '{}');
+  const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(other, twoDaysAgo, twoDaysAgo);
+  fs.utimesSync(legacy, twoDaysAgo, twoDaysAgo);
+  fs.utimesSync(raw, twoDaysAgo, twoDaysAgo);
+  api.pruneRaw();
+  assert.strictEqual(fs.existsSync(other), true, 'unrelated file untouched');
+  assert.strictEqual(fs.existsSync(legacy), true, 'legacy parsed file untouched');
+  assert.strictEqual(fs.existsSync(raw), false, 'stale raw file pruned');
+  delete process.env.CCT_DIR;
+});
+
+test('readTelemetry triggers throttled prune (stale raw files cleaned on a read)', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  api.ensureDir();
+  const stale = path.join(dir, 'telemetry-raw-stale.json');
+  fs.writeFileSync(stale, '{}');
+  const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(stale, twoDaysAgo, twoDaysAgo);
+  // A read for some other (absent) session must still run the prune (no sentinel yet).
+  api.readTelemetry('whatever');
+  assert.strictEqual(fs.existsSync(stale), false, 'stale raw file pruned on read');
+  delete process.env.CCT_DIR;
+});
+
+test('prune is THROTTLED: a fresh sentinel suppresses a second prune', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  api.ensureDir();
+  // First read writes the sentinel and prunes. Now drop a stale file and read again:
+  // within the throttle window the prune is suppressed, so the stale file survives.
+  api.readTelemetry('seed'); // creates the sentinel
+  const stale = path.join(dir, 'telemetry-raw-stale2.json');
+  fs.writeFileSync(stale, '{}');
+  const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(stale, twoDaysAgo, twoDaysAgo);
+  api.readTelemetry('again'); // throttled: should NOT prune
+  assert.strictEqual(fs.existsSync(stale), true, 'throttle suppressed the second prune');
+  // Forcing a prune (or expiring the sentinel) then cleans it.
+  api.pruneRaw();
+  assert.strictEqual(fs.existsSync(stale), false, 'forced prune cleans it');
+  delete process.env.CCT_DIR;
+});
+
+// ============================================================================
+// (8) FRESHNESS (mtime-based for raw, ts-based for legacy) + TTL validation
+// ============================================================================
+
+test('readTelemetry on a raw file is fresh; stale-mtime raw is NOT fresh', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  runEntry({ session_id: 's-fr', context_window: { used_percentage: 42, context_window_size: 200000 } }, { CCT_DIR: dir });
+  assert.strictEqual(api.readTelemetry('s-fr').fresh, true);
+  // Backdate the raw file beyond the TTL -> not fresh.
+  const p = api.rawPath('s-fr');
+  const old = (Date.now() - 10 * 60 * 1000) / 1000;
+  fs.utimesSync(p, old, old);
+  assert.strictEqual(api.readTelemetry('s-fr').fresh, false, 'stale mtime -> not fresh');
+  delete process.env.CCT_DIR;
+});
+
+test('opts.ttlSec overrides the default TTL for a raw file', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  runEntry({ session_id: 's-ttl', context_window: { used_percentage: 1, context_window_size: 200000 } }, { CCT_DIR: dir });
+  const p = api.rawPath('s-ttl');
+  const t50 = (Date.now() - 50 * 1000) / 1000; // 50s old
+  fs.utimesSync(p, t50, t50);
+  assert.strictEqual(api.readTelemetry('s-ttl', { ttlSec: 30 }).fresh, false);
+  assert.strictEqual(api.readTelemetry('s-ttl', { ttlSec: 120 }).fresh, true);
+  delete process.env.CCT_DIR;
+});
+
+test('legacy writeTelemetry path still works (backward compat) - fresh/stale/future', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  api.writeTelemetry('L-fresh', { session_id: 'L-fresh', context_pct: 42, used_percentage: 42,
+    context_window_size: 200000, model: 'm', ts: new Date().toISOString(), source: 'statusline' });
+  assert.strictEqual(api.readTelemetry('L-fresh').fresh, true);
+  api.writeTelemetry('L-stale', { session_id: 'L-stale', context_pct: 42,
+    ts: new Date(Date.now() - 10 * 60 * 1000).toISOString(), source: 'statusline' });
+  assert.strictEqual(api.readTelemetry('L-stale').fresh, false);
+  api.writeTelemetry('L-future', { session_id: 'L-future', context_pct: 42,
+    ts: new Date(Date.now() + 10 * 60 * 1000).toISOString(), source: 'statusline' });
+  assert.strictEqual(api.readTelemetry('L-future').fresh, false);
+  delete process.env.CCT_DIR;
+});
+
+test('readTelemetry returns null when nothing exists for the session', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  assert.strictEqual(api.readTelemetry('nope'), null);
+  delete process.env.CCT_DIR;
+});
+
+test('raw file present but UNPARSEABLE -> null (does not fall back to a stale legacy file)', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  api.ensureDir();
+  // Both a corrupt raw file AND a (valid) legacy file for the same id: raw wins, and a
+  // corrupt raw yields null rather than masking it with the legacy reading.
+  fs.writeFileSync(api.rawPath('s-corrupt'), 'not json <<<');
+  api.writeTelemetry('s-corrupt', { session_id: 's-corrupt', context_pct: 99, ts: api.nowIso() });
+  assert.strictEqual(api.readTelemetry('s-corrupt'), null, 'corrupt raw -> null, legacy not used');
+  delete process.env.CCT_DIR;
+});
+
+test('CCT_TTL_SEC="" / negative fall back to default 120 (legacy path)', function () {
   const dir = tmpDir(); process.env.CCT_DIR = dir;
   const ts = new Date(Date.now() - 50 * 1000).toISOString();
   process.env.CCT_TTL_SEC = '';
@@ -320,22 +520,40 @@ test('CCT_TTL_SEC="" / negative fall back to default 120', function () {
   delete process.env.CCT_TTL_SEC; delete process.env.CCT_DIR;
 });
 
-// ---- CCT_DEBUG opt-in raw dump -------------------------------------------------
+// ============================================================================
+// (9) ON-DEMAND CLI READER (bin/telemetry.js)
+// ============================================================================
 
-test('CCT_DEBUG=1 dumps verbatim raw stdin; telemetry still written', function () {
+test('CLI reader: prints pretty JSON for a session with telemetry (argv id)', function () {
   const dir = tmpDir();
-  const rawPayload = '{"session_id":"s-dbg","context_window":{"used_percentage":12,"context_window_size":200000},"extra":"keep"}';
-  const r = runTelemetry(rawPayload, { CCT_DIR: dir, CCT_DEBUG: '1' });
+  runEntry({ session_id: 's-cli', context_window: { used_percentage: 22, context_window_size: 200000 } }, { CCT_DIR: dir });
+  const r = runReader(['s-cli'], { CCT_DIR: dir });
   assert.strictEqual(r.status, 0);
-  assert.strictEqual(fs.readFileSync(path.join(dir, 'debug-statusline.json'), 'utf8'), rawPayload);
+  const parsed = JSON.parse(r.stdout);
+  assert.strictEqual(parsed.contextPct, 22);
+  assert.strictEqual(parsed.source, 'statusline');
 });
-test('CCT_DEBUG falsey (0/false) writes NO debug file; "1" does', function () {
-  const d0 = tmpDir();
-  runTelemetry('{"session_id":"s-d0","context_window":{"used_percentage":1,"context_window_size":200000}}', { CCT_DIR: d0, CCT_DEBUG: '0' });
-  assert.strictEqual(fs.existsSync(path.join(d0, 'debug-statusline.json')), false);
-  const d1 = tmpDir();
-  runTelemetry('{"session_id":"s-d1","context_window":{"used_percentage":1,"context_window_size":200000}}', { CCT_DIR: d1, CCT_DEBUG: '1' });
-  assert.strictEqual(fs.existsSync(path.join(d1, 'debug-statusline.json')), true);
+
+test('CLI reader: reads session_id from a hook-style stdin payload', function () {
+  const dir = tmpDir();
+  runEntry({ session_id: 's-cli2', context_window: { used_percentage: 8, context_window_size: 200000 } }, { CCT_DIR: dir });
+  const r = runReader([], { CCT_DIR: dir }, '{"session_id":"s-cli2","tool_name":"Bash"}');
+  assert.strictEqual(r.status, 0);
+  assert.strictEqual(JSON.parse(r.stdout).contextPct, 8);
+});
+
+test('CLI reader: "no telemetry for <id>" when absent, exit 0', function () {
+  const dir = tmpDir();
+  const r = runReader(['ghost'], { CCT_DIR: dir });
+  assert.strictEqual(r.status, 0);
+  assert.ok(/no telemetry for ghost/.test(r.stdout));
+});
+
+test('CLI reader: no id and no stdin payload -> usage on stderr, exit 1', function () {
+  const dir = tmpDir();
+  const r = runReader([], { CCT_DIR: dir }, '');
+  assert.strictEqual(r.status, 1);
+  assert.ok(/usage:/.test(r.stderr));
 });
 
 console.log('\n' + pass + '/' + (pass + fail) + ' passed');

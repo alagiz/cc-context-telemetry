@@ -7,6 +7,10 @@ npm-installed consumer would use `require('cc-context-telemetry')` instead.
 These examples are NOT shipped to npm (the package `files` allowlist ships only
 `index.js`, `bin/`, `README.md`, and `LICENSE`).
 
+Note: `bin/telemetry.js` is the same on-demand reader as `print-telemetry.js` (it
+also reads `readTelemetry`), exposed as a shipped CLI; the example is kept here as a
+copy-pasteable standalone.
+
 ## pretooluse-warn.js
 
 A complete PreToolUse hook. It reads the hook payload from stdin, extracts the
@@ -35,5 +39,5 @@ node examples/print-telemetry.js <session-id>
 echo '{"session_id":"<id>"}' | node examples/print-telemetry.js
 ```
 
-Point `CCT_DIR` at a directory with a seeded `telemetry-<id>.json` to try it
-without a live session.
+Point `CCT_DIR` at a directory with a seeded `telemetry-raw-<id>.json` (the raw
+statusline payload) to try it without a live session.

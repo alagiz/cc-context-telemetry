@@ -1,0 +1,340 @@
+#!/bin/sh
+# cc-context-telemetry - OFF-MACHINE, BOUNDED load-reproduction harness.
+#
+# WHAT THIS PROVES (the whole reason this package was rewritten):
+#   Claude Code runs the statusLine command every render and, to keep it bounded,
+#   KILLS the statusLine's FRONT process each render. The OLD wrapper ran
+#   `node telemetry.js` per render. When CC kills the front process WHILE that node
+#   child is still running, the node child REPARENTS TO init (ppid=1) and SURVIVES.
+#   One orphan per render, times many concurrent sessions, times a high render rate,
+#   piles up and can take a machine down. The NEW wrapper is pure shell and EXECs the
+#   wrapped command, so the wrapped command BECOMES the front process CC kills - the
+#   render-kill tears it down and nothing orphans.
+#
+# This harness reproduces that with SYNTHETIC stand-ins ONLY. It NEVER touches real
+# Claude Code, real settings, real auth, or the `claude` binary. It faithfully mimics
+# CC's loop: spawn a wrapper with the payload on a stdin that CLOSES (EOF), let it
+# start, then KILL THE FRONT PID mid-render, repeatedly, at high frequency, across
+# several concurrent "sessions", for a SHORT bounded burst. To make the result robust
+# (not timing-finicky) the OLD wrapper's node step is DELIBERATELY SLOW so the
+# front-pid kill reliably lands while the node child is alive (a wide orphan window).
+#
+# It measures these shapes and asserts:
+#   OLD  (node-per-render, front kill mid-render) => orphans ACCUMULATE  (must be > 0;
+#         if it does NOT, the harness is defective - a false-pass guard fires).
+#   NEW  (pure-shell exec-through, front kill)    => FLAT (0 leftover).
+#   DIR  (direct callee, front kill)              => FLAT baseline (0 leftover).
+#
+# Plus a FORKING-WRAP EQUIVALENCE pair (devil's High #1): a FORKING callee that
+# backgrounds a child outliving the front pid, run BOTH ways:
+#   FDIR (forking callee run DIRECTLY, as Claude Code would)  => some leak N (its OWN).
+#   FWRP (same forking callee run THROUGH the exec-through wrapper) => MUST EQUAL N.
+# Because the entry EXECs the callee (BECOMES the process Claude Code kills), the
+# process tree is identical to direct, so a forking callee orphans the SAME count
+# wrapped as direct - the wrapper is NOT worse; the leak is the forking statusline's
+# own foot-gun. FWRP != FDIR would be a real regression (the harness fails it).
+#
+# SELF-CLEANING + HARD-BOUNDED: every process the harness spawns carries a UNIQUE
+# marker in its command line; a trap on EXIT/INT/TERM SIGKILLs everything carrying that
+# marker, so the harness itself can NEVER pile up even on failure. Bursts and the whole
+# run are time-bounded.
+
+set -u
+
+# ---- bounded knobs (override via env for a quick smoke) ----------------------
+# SLOW_SEC must be LARGE relative to the whole burst so that an orphaned OLD-shape node
+# child is STILL ALIVE when we count (we measure peak simultaneous orphans, which is
+# the pile-up). The NEW/DIR fronts ARE the slow step and get killed, so they die
+# immediately regardless of SLOW_SEC - the comparison stays fair. SLOW_SEC also hard-
+# bounds the run: nothing the harness spawns outlives SLOW_SEC + the trap cleanup.
+SESSIONS="${LR_SESSIONS:-4}"        # concurrent "sessions"
+RENDERS="${LR_RENDERS:-6}"          # render-kills per session per shape
+SLOW_SEC="${LR_SLOW_SEC:-20}"       # slow-step lifetime; must outlast the burst+count
+KILL_AFTER_MS="${LR_KILL_AFTER_MS:-250}"  # land the front-kill mid-render (step alive)
+SETTLE_SEC="${LR_SETTLE_SEC:-1}"    # brief settle for the kill to propagate, then count
+
+# Per-shape spawn count, for context in the report.
+TOTAL_SPAWNS=$(( SESSIONS * RENDERS ))
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ENTRY="$ROOT/bin/cct-statusline"   # the REAL new pure-shell exec-through wrapper
+
+# Unique marker for THIS run: only processes carrying it are ours. Used to count
+# survivors and to clean up. A timestamp+pid keeps it unique across concurrent runs.
+MARKER="cctlr_$$_$(date +%s 2>/dev/null || echo 0)"
+
+WORK="$(mktemp -d 2>/dev/null)" || WORK="${TMPDIR:-/tmp}/$MARKER"
+mkdir -p "$WORK" 2>/dev/null || true
+
+# ---- cleanup: SIGKILL everything carrying our marker, always ----------------
+cleanup() {
+  # Find every pid whose argv contains our unique marker and kill it. pgrep -f scans
+  # command lines; the marker is unique so this hits ONLY our synthetic processes.
+  pids="$(pgrep -f "$MARKER" 2>/dev/null)"
+  if [ -n "$pids" ]; then
+    # shellcheck disable=SC2086
+    kill -9 $pids 2>/dev/null || true
+  fi
+  rm -rf "$WORK" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# Count processes still alive that carry our marker AND match a shape tag. The shape
+# tag distinguishes OLD/NEW/DIR survivors. Excludes this harness and the pgrep itself.
+count_survivors() {
+  tag="$1"
+  pgrep -fc "${MARKER}_${tag}_LEAF" 2>/dev/null || echo 0
+}
+
+# ---- synthetic leaf programs -------------------------------------------------
+# The SLOW node step (OLD shape only). A real node process: it sleeps SLOW_SEC so the
+# front-kill reliably lands while it is alive, then exits. It carries the marker+tag in
+# argv (via process.argv) so the harness can find/count/kill it. This is a tiny inline
+# script; it does NOT require the lib, call claude, or scan anything.
+SLOWNODE="$WORK/slow_node.js"
+cat > "$SLOWNODE" <<'EOF'
+// argv: [node, slow_node.js, <marker_tag_LEAF>, <slow_sec>]
+var sec = parseInt(process.argv[3], 10) || 1;
+// Busy-free sleep: keep the process alive without burning CPU. setTimeout holds the
+// event loop open exactly sec seconds, then exit.
+setTimeout(function () { process.exit(0); }, sec * 1000);
+EOF
+
+# The fake "slow statusline callee" (used by NEW exec-through and by DIR baseline). A
+# heavy real statusline that stays alive SLOW_SEC. It consumes stdin to EOF (as a
+# statusline does), then EXECs a marker-tagged node sleeper so the process carries the
+# marker in argv and remains the front pid (see the inline comment for why exec, not a
+# bare sleep child).
+CALLEE="$WORK/callee.sh"
+cat > "$CALLEE" <<EOF
+#!/bin/sh
+# argv \$1 = marker_tag_LEAF (kept in the command line for counting).
+cat >/dev/null 2>&1   # consume the statusline stdin to EOF (exercise the EOF path)
+# EXEC a marker-tagged node sleeper so THIS callee process (which the entry exec'd,
+# making it the front pid) keeps the marker in argv and stays the front pid. Two
+# reasons to exec rather than spawn a bare \`sleep\`: (1) the front-kill then tears
+# down the slow step directly (proving exec-through tears down the WHOLE chain), and
+# (2) if a slow step ever lingers it still carries the marker, so the harness trap
+# reaps it - a bare \`sleep\` child would orphan WITHOUT the marker and escape cleanup.
+exec node "$SLOWNODE" "\$1" "$SLOW_SEC"
+EOF
+chmod +x "$CALLEE"
+
+# The FORKING callee (used by the equivalence shapes FDIR and FWRP). This is a
+# statusline that does its OWN foot-gun: it BACKGROUNDS a child (a marker-tagged node
+# sleeper) that OUTLIVES the front pid, then the front returns immediately. A statusline
+# that backgrounds a helper like this leaks that helper on a render-kill - but the leak
+# is the STATUSLINE'S OWN, not the wrapper's. We use it to prove the exec-through
+# wrapper is not WORSE than direct: because the entry EXECs this callee (BECOMES it),
+# the process tree is IDENTICAL to running the callee directly, so the SAME number of
+# children orphan either way. The front itself exits fast (no slow step) so the kill
+# lands on an already-departed front and only the backgrounded child can survive - the
+# pure forking leak, isolated.
+FORKCALLEE="$WORK/forkcallee.sh"
+cat > "$FORKCALLEE" <<EOF
+#!/bin/sh
+# argv \$1 = marker_tag_LEAF (kept in the backgrounded child's command line for counting).
+cat >/dev/null 2>&1   # consume the statusline stdin to EOF (as a statusline does)
+# BACKGROUND a marker-tagged node sleeper and do NOT wait for it: this is the forking
+# statusline foot-gun. The child reparents to init when the front exits/dies and
+# survives the render-kill. It carries the marker so the harness trap still reaps it.
+node "$SLOWNODE" "\$1" "$SLOW_SEC" &
+# Front returns IMMEDIATELY (the backgrounded child is detached from the front's fate).
+exit 0
+EOF
+chmod +x "$FORKCALLEE"
+
+# The OLD wrapper (the BUGGY shape we are reproducing). Pure shell, but it SPAWNS node
+# as a CHILD per render (does NOT exec it) and then would run the callee. Because node
+# is a child of this wrapper, killing THIS wrapper's pid (the front pid CC kills) does
+# NOT kill node: node reparents to init and survives => the orphan. We do not even need
+# the callee step to leak; the node child alone is the leak. This faithfully models
+# `node telemetry.js` running per render under the old design.
+OLDWRAP="$WORK/old_wrap.sh"
+cat > "$OLDWRAP" <<EOF
+#!/bin/sh
+# argv \$1 = marker_tag_LEAF for the node child
+cat >/dev/null 2>&1            # consume stdin to EOF (as a statusline does)
+# Spawn node as a CHILD (background) - the old per-render node step, made slow.
+node "$SLOWNODE" "\$1" "$SLOW_SEC" &
+# The wrapper then waits on its child (as the old wrapper waited for the writer before
+# exec-ing the real statusline). While it waits, CC kills THIS front pid; the node
+# child orphans to init.
+wait
+EOF
+chmod +x "$OLDWRAP"
+
+# The NEW wrapper: the REAL bin/cct-statusline, exec-through to the callee. We do not
+# re-implement it; we use the shipped entry so the harness proves the ACTUAL code.
+
+# ---- one "render" of a shape: start the front process on a CLOSING stdin, then
+#      KILL THE FRONT PID mid-render (KILL_AFTER_MS), as Claude Code does. -------
+render_kill() {
+  shape="$1"; leaf="$2"
+  payload='{"session_id":"lr","context_window":{"used_percentage":50,"context_window_size":200000}}'
+  case "$shape" in
+    OLD)
+      # Front = the old wrapper sh; node is its child (will orphan on the kill).
+      printf '%s' "$payload" | /bin/sh "$OLDWRAP" "$leaf" >/dev/null 2>&1 &
+      ;;
+    NEW)
+      # Front = the real entry; it EXECs the callee, so the callee BECOMES the front
+      # pid. Killing the front pid kills the callee. Nothing orphans. The entry consumes
+      # stdin to EOF (cat), so the closing stdin path is exercised too.
+      printf '%s' "$payload" | \
+        CCT_DIR="$WORK/tel" CCT_WRAP="'$CALLEE' '$leaf'" /bin/sh "$ENTRY" >/dev/null 2>&1 &
+      ;;
+    DIR)
+      # Baseline: the callee run DIRECTLY. Front = the callee.
+      printf '%s' "$payload" | /bin/sh "$CALLEE" "$leaf" >/dev/null 2>&1 &
+      ;;
+    FDIR)
+      # Equivalence baseline: the FORKING callee run DIRECTLY, exactly as Claude Code
+      # would run a forking statusline. Front = the forking callee; it backgrounds a
+      # child that outlives it. Whatever this leaks is the statusline's OWN foot-gun.
+      printf '%s' "$payload" | /bin/sh "$FORKCALLEE" "$leaf" >/dev/null 2>&1 &
+      ;;
+    FWRP)
+      # Equivalence test: the SAME forking callee run THROUGH the real exec-through
+      # entry. Because the entry EXECs the callee (BECOMES it), the process tree is
+      # IDENTICAL to FDIR, so it must orphan the SAME count - the wrapper adds no extra
+      # orphan over direct.
+      printf '%s' "$payload" | \
+        CCT_DIR="$WORK/tel" CCT_WRAP="'$FORKCALLEE' '$leaf'" /bin/sh "$ENTRY" >/dev/null 2>&1 &
+      ;;
+  esac
+  front=$!
+  # Let the render get going (the slow step must be alive when we kill).
+  sleep_ms "$KILL_AFTER_MS"
+  # KILL THE FRONT PID (what CC does every render). Not the whole tree - just the front
+  # pid, exactly as CC kills the statusline process. A correctly-exec'd wrapper tears
+  # down with this; a wrapper that spawned a child leaks that child.
+  kill -9 "$front" 2>/dev/null || true
+}
+
+# millisecond sleep without spawning a per-call helper that could itself pile up. Uses
+# a single short `sleep` with a fractional arg where supported; falls back to 1s.
+sleep_ms() {
+  ms="$1"
+  s=$(awk -v m="$ms" 'BEGIN{ printf "%.3f", m/1000 }' 2>/dev/null)
+  [ -n "$s" ] || s=1
+  sleep "$s" 2>/dev/null || sleep 1
+}
+
+# ---- run one shape: SESSIONS concurrent, each doing RENDERS render-kills -------
+run_shape() {
+  shape="$1"
+  sess=0
+  while [ "$sess" -lt "$SESSIONS" ]; do
+    (
+      r=0
+      while [ "$r" -lt "$RENDERS" ]; do
+        # Each leaf gets a unique-enough tag carrying the shape so we can count it.
+        leaf="${MARKER}_${shape}_LEAF_${sess}_${r}"
+        render_kill "$shape" "$leaf"
+        r=$(( r + 1 ))
+      done
+    ) &
+    sess=$(( sess + 1 ))
+  done
+  wait   # all sessions for this shape done firing render-kills
+}
+
+echo "cc-context-telemetry load-repro"
+echo "  marker=$MARKER"
+echo "  sessions=$SESSIONS renders/session=$RENDERS slow=${SLOW_SEC}s kill_after=${KILL_AFTER_MS}ms settle=${SETTLE_SEC}s"
+echo "  total render-kills per shape: $TOTAL_SPAWNS"
+echo
+
+mkdir -p "$WORK/tel" 2>/dev/null || true
+
+OVERALL=0
+
+for shape in OLD NEW DIR FDIR FWRP; do
+  run_shape "$shape"
+  # Let init reap orphans / teardown finish, THEN count survivors carrying our marker.
+  sleep "$SETTLE_SEC"
+  n="$(count_survivors "$shape")"
+  # pgrep -fc prints 0 when none; normalize to an integer.
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf 'shape %-3s : %s leftover process(es) carrying the marker after %s render-kills\n' \
+    "$shape" "$n" "$TOTAL_SPAWNS"
+
+  case "$shape" in
+    OLD)
+      # FALSE-PASS GUARD: the OLD shape MUST leak, or the harness is not faithfully
+      # reproducing the kill-mid-render orphan (and any "NEW is flat" claim is hollow).
+      if [ "$n" -le 0 ]; then
+        echo "  DEFECT: OLD shape did not orphan - harness is not reproducing the bug." >&2
+        OVERALL=1
+      else
+        echo "  -> OLD orphaned $n node child(ren) to init (the pile-up reproduced). PASS"
+      fi
+      OLD_N="$n"
+      ;;
+    NEW)
+      if [ "$n" -ne 0 ]; then
+        echo "  REGRESSION: NEW exec-through wrapper LEFT $n process(es) - it should be flat." >&2
+        OVERALL=1
+      else
+        echo "  -> NEW exec-through: 0 leftover (front-kill tore down the exec'd callee). PASS"
+      fi
+      NEW_N="$n"
+      ;;
+    DIR)
+      if [ "$n" -ne 0 ]; then
+        echo "  NOTE: DIR baseline left $n process(es) - baseline should also be flat." >&2
+        OVERALL=1
+      else
+        echo "  -> DIR baseline: 0 leftover. PASS"
+      fi
+      DIR_N="$n"
+      ;;
+    FDIR)
+      # A forking callee run DIRECTLY. It MAY leak (its own backgrounded child outlives
+      # the front and reparents to init) or it may be reaped if the kill reaches the
+      # child - either way, this is the DIRECT-execution baseline for the equivalence
+      # claim. We do NOT assert a specific count here; we assert FWRP EQUALS it below.
+      echo "  -> FDIR (forking callee, DIRECT): $n leftover (the statusline's OWN fork leak baseline)."
+      FDIR_N="$n"
+      ;;
+    FWRP)
+      # The SAME forking callee run THROUGH the exec-through wrapper. Must EQUAL FDIR:
+      # the exec-through wrapper introduces NO extra orphan over direct execution.
+      echo "  -> FWRP (forking callee, WRAPPED via exec-through): $n leftover."
+      FWRP_N="$n"
+      ;;
+  esac
+  echo
+  # Clean THIS shape's survivors before the next shape so counts do not bleed across.
+  cleanup_shape="$(pgrep -f "${MARKER}_${shape}_LEAF" 2>/dev/null)"
+  if [ -n "$cleanup_shape" ]; then
+    # shellcheck disable=SC2086
+    kill -9 $cleanup_shape 2>/dev/null || true
+  fi
+  sleep 1
+done
+
+# ---- FORKING-WRAP EQUIVALENCE assertion --------------------------------------
+# Claim: the exec-through wrapper is not WORSE than direct execution. A statusline that
+# backgrounds a helper leaks that helper under BOTH direct (FDIR) and wrapped (FWRP)
+# use, by the SAME count - the wrapper adds no extra orphan. If FWRP != FDIR, the
+# exec-through model is leaking something direct execution would not: a real regression.
+echo "equivalence: FDIR=${FDIR_N:-?}  FWRP=${FWRP_N:-?} (must be EQUAL - wrapper adds no orphan over direct)"
+if [ "${FDIR_N:-x}" = "${FWRP_N:-y}" ]; then
+  echo "  -> FORKING-WRAP EQUIVALENCE holds: forking leak is IDENTICAL direct vs wrapped (the wrapper is not worse). PASS"
+else
+  echo "  REGRESSION: FWRP (${FWRP_N:-?}) != FDIR (${FDIR_N:-?}) - the exec-through wrapper orphaned a DIFFERENT count than direct." >&2
+  OVERALL=1
+fi
+echo
+
+echo "summary: OLD=${OLD_N:-?} (must be >0)   NEW=${NEW_N:-?} (must be 0)   DIR=${DIR_N:-?} (must be 0)   FDIR==FWRP=${FDIR_N:-?} (forking leak equal direct vs wrapped)"
+if [ "$OVERALL" -eq 0 ]; then
+  echo "RESULT: PASS - OLD accumulates orphans, NEW and DIR are flat, forking leak is equal direct vs wrapped (wrapper adds nothing)."
+else
+  echo "RESULT: FAIL - see messages above."
+fi
+
+# trap cleanup runs on exit (kills any stragglers carrying the marker).
+exit "$OVERALL"

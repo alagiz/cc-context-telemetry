@@ -4,20 +4,26 @@ Claude Code hooks and plugins cannot see context fullness or rate limits. The ON
 place Claude Code exposes the authoritative `context_window` (used percentage,
 window size) and Pro/Max `rate_limits` is the `statusLine` command. This tiny,
 zero-dependency library bridges that gap: it is a statusLine wrapper that captures
-Claude Code's authoritative telemetry, writes it to a per-session file your hooks
-can read, and passes through to your existing statusline so you keep your bar.
+Claude Code's authoritative telemetry to a per-session file your hooks can read, and
+passes through to your existing statusline so you keep your bar.
 
 One job, three pieces:
 
-- `bin/cct-statusline` - the POSIX shell entry Claude Code calls as its statusLine.
-  It captures the payload, runs the telemetry writer, and then - if `CCT_WRAP` is set
-  to your original statusline command - **`exec`s that command** so it BECOMES the
-  statusLine process (see Process handling for why this matters). In standalone mode
-  it prints a minimal bar so the segment is never blank.
-- `bin/telemetry.js` - the telemetry writer. A fast node process that parses the
-  payload, writes `telemetry-<session>.json`, and exits. It spawns nothing.
-- `index.js` - `readTelemetry(sessionId)` for your hooks to read the latest reading,
-  with a freshness check.
+- `bin/cct-statusline` - the POSIX shell entry Claude Code calls as its statusLine,
+  every render. It is **pure shell, with NO Node on the per-render path**: it reads the
+  payload once, extracts the session id, and atomically writes the RAW payload to
+  `telemetry-raw-<session>.json`. Then, if `CCT_WRAP` is set to your original
+  statusline command, it **`exec`s that command** so it BECOMES the statusLine process
+  (see Process handling for why this matters); in standalone mode it prints a minimal
+  bar so the segment is never blank. There is no per-render Node spawn at all (an
+  earlier design spawned `node` every render; across many sessions that piled up - see
+  Process handling).
+- `index.js` - the consumer. `readTelemetry(sessionId)` reads the raw payload file,
+  parses it ON DEMAND, and returns the latest reading with a freshness check. So all
+  JSON parsing happens here, only when a hook actually asks - never on the hot path. It
+  also prunes stale per-session raw files (off the hot path, throttled).
+- `bin/telemetry.js` - an on-demand CLI reader over `readTelemetry`, for the manual
+  live check. It is NOT in the per-render path; it runs only when you invoke it.
 
 Zero third-party dependencies. Node >= 18. POSIX shell (Linux/macOS). Never throws,
 never calls `claude`.
@@ -53,8 +59,9 @@ exactly as if it were your statusLine directly:
 ```
 
 (If your Claude Code version does not support an `env` block on `statusLine`, export
-`CCT_WRAP` in your shell profile instead. If `node` is not on the PATH Claude Code
-uses, set `CCT_NODE` to its absolute path.)
+`CCT_WRAP` in your shell profile instead. The per-render path is pure shell, so no
+`node` needs to be on Claude Code's PATH for the wrapper itself - only your `CCT_WRAP`
+command and your hooks need their own interpreters.)
 
 ## Consumer API (hooks)
 
@@ -85,6 +92,11 @@ if (t && t.fresh && t.contextPct >= 85) { /* near the wall: act */ }
 }
 ```
 
+`contextPct` / `usedPercentage` are passed through verbatim from Claude Code's
+`context_window.used_percentage` (a percentage, 0..100 in practice). The library does
+NOT range-clamp them; it only verifies they are numbers, so treat them as advisory and
+do not assume a strict `0..100` bound. `fresh` already rejects non-finite values.
+
 `fresh` rejects both stale and far-future timestamps (it checks the absolute age
 against the TTL). When `fresh` is false, treat it as "no signal" and stay
 observe-only. `opts.ttlSec` (or env `CCT_TTL_SEC`) overrides the default 120s TTL.
@@ -92,33 +104,44 @@ An override is honored only when it is a finite number greater than 0; a blank,
 zero, negative, or non-numeric value falls back to the default.
 
 The module also exports `DEFAULT_TTL_SEC` (the 120s default, a number),
-`writeTelemetry(sessionId, obj)`, `telemetryDir()`, `telemetryPath(sessionId)`,
-and `nowIso()`. `telemetryPath` sanitizes the session id (everything outside
-`[A-Za-z0-9_-]` becomes `_`), so a reading is always confined to the telemetry
-directory.
+`parsePayload(d, sessionId)` (the raw-to-normalized field mapping),
+`rawPath(sessionId)`, `pruneRaw()`, `telemetryDir()`, `telemetryPath(sessionId)`,
+`writeTelemetry(sessionId, obj)`, and `nowIso()`. The session id is sanitized
+(everything outside `[A-Za-z0-9_-]` becomes `_`), so a reading is always confined to
+the telemetry directory.
 
 ## Telemetry file
 
-One file per session at `<dir>/telemetry-<session>.json`:
+The pure-shell entry writes ONE file per session: the RAW Claude Code statusline
+payload, verbatim, at `<dir>/telemetry-raw-<session>.json`. It is overwritten each
+render (atomically, via a temp file + rename), so a single session never grows the
+directory. `readTelemetry(sessionId)` parses that raw file on demand. The raw payload
+looks like (fields vary by plan/model/version - the lib reads them straight, never
+assuming a shape):
 
 ```json
 {
   "session_id": "abc123",
-  "context_pct": 47.2,
-  "used_percentage": 47.2,
-  "context_window_size": 200000,
-  "model": "claude-opus-4-1",
-  "ts": "2026-06-22T12:00:00.000Z",
-  "source": "statusline",
-  "five_hour_pct": 12,
-  "seven_day_pct": 30
+  "context_window": { "used_percentage": 47.2, "context_window_size": 200000 },
+  "rate_limits": { "five_hour": { "used_percentage": 12 }, "seven_day": { "used_percentage": 30 } },
+  "model": { "id": "claude-opus-4-1" }
 }
 ```
 
-`five_hour_pct` / `seven_day_pct` are present only when Claude Code reported them
-(Pro/Max OAuth). They are omitted (never written as 0) for API-key / Bedrock /
-Vertex. `context_pct` is `null` before the first API response and right after a
-compaction.
+`rate_limits` is present only for Pro/Max OAuth; it is absent (so `fiveHourPct` /
+`sevenDayPct` are omitted, never reported as 0) for API-key / Bedrock / Vertex.
+`context_window.used_percentage` is `null` before the first API response and right
+after a compaction (so `contextPct` is `null` and `fresh` is `false`).
+
+### Raw-file hygiene
+
+`telemetry-raw-<session>.json` is per session, so live sessions bound the file count,
+but a long-lived machine sees a new session id (UUID) per `claude` run. So
+`readTelemetry` prunes off the hot path (throttled, at most once per
+`CCT_PRUNE_EVERY_SEC`, default hourly): it deletes raw files older than
+`CCT_PRUNE_AGE_SEC` (default 1 day) and then caps the total at `CCT_PRUNE_MAX_FILES`
+(default 200, deleting the oldest beyond the cap). It only ever touches this lib's own
+`telemetry-raw-*.json` files. Pruning is best-effort and never throws.
 
 ## Environment variables
 
@@ -130,18 +153,21 @@ compaction.
   directly). If you need a pipeline, put it in a small script and point `CCT_WRAP` at
   that script. When `CCT_WRAP` is unset, the entry prints its own minimal bar
   (`ctx 47% | 5h 12% | 7d 30%`).
-- `CCT_NODE` - absolute path to the `node` binary, if `node` is not on the PATH that
-  Claude Code uses to run the statusLine. Defaults to `node`.
-- `CCT_DIR` - telemetry directory (default `~/.claude/cc-context-telemetry/`).
+- `CCT_DIR` - telemetry directory (default `~/.claude/cc-context-telemetry/`). The
+  shell entry mirrors this default; set it on the statusLine env AND for your hooks so
+  both sides agree.
 - `CCT_TTL_SEC` - freshness window for `readTelemetry` in seconds (default 120).
-- `CCT_DEBUG` - when set to a truthy value (e.g. `1`, `true`, `yes`), the wrapper
-  dumps the exact raw statusline stdin to `<CCT_DIR>/debug-statusline.json`,
-  overwriting it each call so it is always the latest real payload. The values
-  `0`, `false`, `off`, `no`, and an empty string (case-insensitive) count as OFF.
-  Off by default; best-effort (it never throws, never affects the bar or exit
-  code). Use it to inspect the real payload field paths when telemetry comes back
-  null. The dump may contain real session content, overwrites in place, and is
-  NOT auto-cleaned, so delete it when you are done.
+- `CCT_PRUNE_AGE_SEC` - delete raw files older than this on the reader side (default
+  86400, 1 day).
+- `CCT_PRUNE_MAX_FILES` - hard cap on raw files; the oldest beyond it are deleted
+  (default 200).
+- `CCT_PRUNE_EVERY_SEC` - throttle: prune at most once per this interval across reader
+  invocations (default 3600, hourly).
+
+The raw payload file (`telemetry-raw-<session>.json`) IS the verbatim statusline
+payload, so it doubles as the debug dump: inspect it directly to see the real field
+paths Claude Code sent. It may contain real session content and is overwritten each
+render; the reader auto-prunes it (see Raw-file hygiene).
 
 ## Process handling (why the wrapper is safe to run every render)
 
@@ -161,9 +187,35 @@ spawned statusline can survive, and a heavy statusline (one that itself shells o
 then leaks an instance every render until the machine is overloaded. `exec`, not spawn,
 is what makes wrapping safe. (Versions before 0.2.0 spawned; do not use them.)
 
-The only added process is the telemetry writer - a fast node process that parses the
-payload, writes one small file, and exits in milliseconds. It spawns nothing and cannot
-accumulate.
+A corollary: do NOT make YOUR wrapped statusline background a helper (a trailing `&` or
+a detached child that outlives the front process). Such a statusline leaks that helper
+on every render-kill - but it leaks IDENTICALLY whether you run it directly or through
+this wrapper. Because `exec` makes your command BECOME the process Claude Code kills, the
+process tree is the same as running it directly, so the wrapper introduces no extra
+orphan; the leak is the forking statusline's own foot-gun. `test/loadrepro` proves this
+with a forking callee run both ways and asserts the orphan counts are EQUAL.
+
+There is also NO Node process on the per-render path. An earlier design ran a small
+`node` telemetry writer every render. When Claude Code killed the statusline's front
+process while that node child was still running, the node child reparented to init and
+SURVIVED - one orphan per render, times many concurrent sessions, times a high render
+rate, which piled up. The rewrite moved all JSON parsing off the hot path (the shell
+entry only writes the raw payload; `index.js` parses on demand), so the per-render path
+is pure shell and spawns nothing that can outlive the render. `test/loadrepro` is a
+synthetic, self-cleaning harness that reproduces the old node-per-render orphan pile-up
+and asserts the current exec-through wrapper leaves nothing behind.
+
+The entry reads stdin with a plain `cat` and NO timeout, relying on Claude Code closing
+the statusLine's stdin after a single bounded write (the same contract a direct
+statusLine command sees). This is not an assumption: the `adtention` statusLine binary
+reads its stdin with `io.ReadAll(os.Stdin)` (which blocks until EOF) and runs flat as a
+DIRECT statusLine with no pile-up, so if Claude Code did not close the statusLine stdin a
+direct `adtention` would hang every render - it does not, so Claude Code closes it, and
+our `cat` (reading the identical stdin) gets the identical EOF. We deliberately avoid a
+per-render timeout subprocess because that would reintroduce the per-render spawn this
+rewrite removed. If a future Claude Code build ever held statusLine stdin open, the
+`cat` would block - so confirm the EOF behavior on your Claude Code version with the one
+cheap session below before trusting it in long autonomous runs.
 
 ## Verify it works (one cheap session)
 
@@ -171,9 +223,9 @@ The wrapper has been tested against stub payloads. To confirm it parses Claude
 Code's REAL statusline payload, one short session is enough (the statusline
 renders every turn, so there is no need to fill the context):
 
-1. Wire `bin/cct-statusline` as your `statusLine` (see Wiring above) and set
-   `CCT_DEBUG=1` so the raw payload is also dumped. Add `CCT_WRAP` (your original
-   statusline command) so you keep your existing bar during the test. For example:
+1. Wire `bin/cct-statusline` as your `statusLine` (see Wiring above). Add `CCT_WRAP`
+   (your original statusline command) so you keep your existing bar during the test.
+   For example:
 
    ```json
    {
@@ -181,32 +233,30 @@ renders every turn, so there is no need to fill the context):
        "type": "command",
        "command": "/absolute/path/to/cc-context-telemetry/bin/cct-statusline",
        "env": {
-         "CCT_WRAP": "node /absolute/path/to/your/original-statusline.js",
-         "CCT_DEBUG": "1"
+         "CCT_WRAP": "node /absolute/path/to/your/original-statusline.js"
        }
      }
    }
    ```
 
    (If your Claude Code version does not support an `env` block on `statusLine`,
-   export `CCT_WRAP` and `CCT_DEBUG=1` in your shell profile instead.) Without
-   `CCT_WRAP`, the minimal standalone `ctx ..%` bar REPLACES your existing bar for
-   the duration of the test; remove the test wiring (or set `CCT_WRAP`) to get it
-   back. Editing `settings.json` only takes effect in a FRESH session, so start a
-   new one after saving.
+   export `CCT_WRAP` in your shell profile instead.) Without `CCT_WRAP`, the minimal
+   standalone `ctx ..%` bar REPLACES your existing bar for the duration of the test;
+   remove the test wiring (or set `CCT_WRAP`) to get it back. Editing `settings.json`
+   only takes effect in a FRESH session, so start a new one after saving.
 
 2. Open any session and send ONE message. The statusline runs that turn.
 
-3. Check `~/.claude/cc-context-telemetry/telemetry-<session>.json` for sane
-   values: a numeric (or null) `context_pct`, a `context_window_size`, and a
-   `model`. Your session id is the `<session>` in that filename (the only
-   `telemetry-*.json` written this session), and it is also the `session_id`
-   field in any hook payload. You can also run
-   `node examples/print-telemetry.js <session-id>` to print it as pretty JSON.
+3. Run `node examples/print-telemetry.js <session-id>` to print the parsed reading
+   as pretty JSON; check for sane values (a numeric or null `contextPct`, a
+   `windowSize`, a `model`). Your session id is the `session_id` field in any hook
+   payload, and it is the `<session>` in the raw file written this session (the only
+   `telemetry-raw-*.json` for this session, under
+   `~/.claude/cc-context-telemetry/`).
 
-4. If the values are null or missing, inspect
-   `~/.claude/cc-context-telemetry/debug-statusline.json` (the verbatim raw
-   payload) to see the real field paths Claude Code sent.
+4. If the values are null or missing, inspect the raw file itself
+   (`~/.claude/cc-context-telemetry/telemetry-raw-<session>.json`), which IS the
+   verbatim statusline payload, to see the real field paths Claude Code sent.
 
 ## Examples
 

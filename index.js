@@ -4,9 +4,12 @@
 // Claude Code hooks and plugins cannot see context fullness or rate limits. The
 // ONLY place Claude Code exposes the AUTHORITATIVE context_window /
 // rate_limits is the statusLine command. The statusLine entry (bin/cct-statusline)
-// and its telemetry writer (bin/telemetry.js) capture that telemetry and write it to
-// a per-session file. This module is the reader: a hook calls readTelemetry(sessionId)
-// to get the latest reading.
+// is PURE SHELL: every render it writes the RAW statusline payload to a per-session
+// file (telemetry-raw-<session>.json) with NO Node and NO JSON parsing (a Node spawn
+// per render across many sessions piles up load). ALL parsing happens HERE, on
+// demand, when a hook calls readTelemetry(sessionId): this module reads the raw
+// payload file, parses it, and returns the authoritative reading. So the per-render
+// hot path stays Node-free and the parse cost is paid only when a hook actually asks.
 //
 // CONTRACT: never throws. readTelemetry returns a normalized object or null.
 const fs = require('fs');
@@ -29,18 +32,32 @@ function sanitizeId(sessionId) {
   return s.length ? s : 'default';
 }
 
-function telemetryPath(sessionId) {
+// Build a contained per-session path under telemetryDir() for the given filename
+// prefix. The sanitized id cannot escape; the resolve check is belt-and-suspenders.
+function sessionPath(prefix, sessionId, fallbackName) {
   const dir = telemetryDir();
   const safe = sanitizeId(sessionId);
-  const p = path.join(dir, 'telemetry-' + safe + '.json');
-  // Belt-and-suspenders: if the resolved path is not strictly inside the
-  // telemetry dir, fall back to the sanitized-default path. With sanitizeId this
-  // never triggers, but it guarantees containment even if sanitizeId regresses.
-  const prefix = path.resolve(dir) + path.sep;
-  if (!(path.resolve(p) + path.sep).startsWith(prefix)) {
-    return path.join(dir, 'telemetry-default.json');
+  const p = path.join(dir, prefix + safe + '.json');
+  const guard = path.resolve(dir) + path.sep;
+  if (!(path.resolve(p) + path.sep).startsWith(guard)) {
+    return path.join(dir, fallbackName);
   }
   return p;
+}
+
+// Path of the parsed-telemetry file. Retained for backward compatibility and for
+// tests/consumers that stub telemetry via writeTelemetry; the live shell entry no
+// longer writes this file (it writes the raw payload, see rawPath).
+function telemetryPath(sessionId) {
+  return sessionPath('telemetry-', sessionId, 'telemetry-default.json');
+}
+
+// Path of the RAW statusline payload the shell entry writes every render. This is
+// the live source readTelemetry parses on demand. The shell entry uses the SAME
+// sanitization and "default" empty-id fallback as sanitizeId here, so both sides
+// resolve the same filename.
+function rawPath(sessionId) {
+  return sessionPath('telemetry-raw-', sessionId, 'telemetry-raw-default.json');
 }
 
 function ensureDir() {
@@ -48,6 +65,105 @@ function ensureDir() {
 }
 
 function nowIso() { return new Date().toISOString(); }
+
+// Raw-file hygiene. The shell entry writes one telemetry-raw-<session>.json per
+// session, overwriting it each render, so a single live session never grows the dir.
+// But a long-lived machine accumulates one file per session id seen over time (each
+// `claude` invocation is a new UUID), and nothing on the hot path prunes them. So the
+// READER prunes here, OFF the per-render hot path: pruning runs only when a hook
+// actually calls readTelemetry (best-effort, never throws, never blocks output).
+//
+// Bounded two-rule prune over ONLY this lib's own raw files (telemetry-raw-*.json):
+//   1. delete any raw file whose mtime is older than CCT_PRUNE_AGE_SEC (default 1 day)
+//      - a session untouched for that long is dead,
+//   2. then, if more than CCT_PRUNE_MAX_FILES (default 200) remain, delete the oldest
+//      until at most MAX remain - a hard cap so the dir can never grow without bound.
+// The cost is one readdir + lstat per raw file; bounded by the cap and only paid on a
+// reader call. We NEVER touch files we did not create (only the telemetry-raw- prefix,
+// not the legacy telemetry- file the consumer may stub, not the user's other files).
+const DEFAULT_PRUNE_AGE_SEC = 24 * 60 * 60; // 1 day
+const DEFAULT_PRUNE_MAX_FILES = 200;
+
+function posIntEnv(name, def) {
+  const v = process.env[name];
+  if (v == null || v === '') return def;
+  const n = Number(v);
+  return (isFinite(n) && n > 0) ? n : def;
+}
+
+// Cross-process throttle so prune runs at most once per CCT_PRUNE_EVERY_SEC even
+// though every hook is a fresh Node process (an in-process flag would never help).
+// We touch a sentinel file and skip the prune if it was touched recently. Best-effort
+// (a failed stat/touch just means we prune this call). force=true bypasses (tests).
+const DEFAULT_PRUNE_EVERY_SEC = 60 * 60; // at most once per hour
+
+function pruneThrottled(force) {
+  try {
+    if (force) { pruneRaw(); return; }
+    const everySec = posIntEnv('CCT_PRUNE_EVERY_SEC', DEFAULT_PRUNE_EVERY_SEC);
+    const dir = telemetryDir();
+    const sentinel = path.join(dir, '.cct-prune-stamp');
+    let due = true;
+    try {
+      const st = fs.statSync(sentinel);
+      if ((Date.now() - st.mtimeMs) / 1000 < everySec) due = false;
+    } catch (e) { /* no sentinel yet -> due */ }
+    if (!due) return;
+    // Touch the sentinel BEFORE pruning so concurrent readers do not all prune at once.
+    try { fs.writeFileSync(sentinel, ''); } catch (e) {}
+    pruneRaw();
+  } catch (e) { /* best-effort */ }
+}
+
+function pruneRaw() {
+  try {
+    const dir = telemetryDir();
+    let names;
+    try { names = fs.readdirSync(dir); } catch (e) { return; }
+    const ageSec = posIntEnv('CCT_PRUNE_AGE_SEC', DEFAULT_PRUNE_AGE_SEC);
+    const maxFiles = posIntEnv('CCT_PRUNE_MAX_FILES', DEFAULT_PRUNE_MAX_FILES);
+    const now = Date.now();
+    const cutoff = now - ageSec * 1000;
+    const live = []; // { path, mtimeMs } for raw files that survive the age rule
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      // Reclaim a stale atomic-write temp left by a crash BETWEEN cp and mv (the shell
+      // removes its own temp on a normal mv-failure, so this only catches a hard crash
+      // mid-write). The temp is ".telemetry-raw-<sid>.<pid>.tmp" (leading dot). Only
+      // OUR temps, only when old, so a temp from an in-flight write is never touched.
+      if (name.indexOf('.telemetry-raw-') === 0 && name.slice(-4) === '.tmp') {
+        const tp = path.join(dir, name);
+        try {
+          const tst = fs.lstatSync(tp);
+          if (tst.isFile() && tst.mtimeMs < cutoff) fs.unlinkSync(tp);
+        } catch (e) {}
+        continue;
+      }
+      // ONLY our own raw payload files for the main rules.
+      if (name.indexOf('telemetry-raw-') !== 0) continue;
+      if (name.slice(-5) !== '.json') continue;
+      const p = path.join(dir, name);
+      let st;
+      try { st = fs.lstatSync(p); } catch (e) { continue; }
+      if (!st.isFile()) continue;
+      // Rule 1: too old -> delete now. Treat far-future mtimes as live (do not delete
+      // a file whose clock is ahead; the count cap will still bound the dir).
+      if (st.mtimeMs < cutoff) {
+        try { fs.unlinkSync(p); } catch (e) {}
+        continue;
+      }
+      live.push({ path: p, mtimeMs: st.mtimeMs });
+    }
+    // Rule 2: hard count cap. Delete the OLDEST surviving files beyond the cap.
+    if (live.length > maxFiles) {
+      live.sort(function (a, b) { return a.mtimeMs - b.mtimeMs; }); // oldest first
+      const toDelete = live.length - maxFiles;
+      for (let i = 0; i < toDelete; i++) {
+        try { fs.unlinkSync(live[i].path); } catch (e) {}
+      }
+    }
+  } catch (e) { /* hygiene is best-effort; never affect the reader */ }
+}
 
 // Default freshness window in seconds. Override via env CCT_TTL_SEC or opts.ttlSec.
 const DEFAULT_TTL_SEC = 120;
@@ -78,40 +194,106 @@ function writeTelemetry(sessionId, obj) {
   } catch (e) { return false; }
 }
 
-// Read the latest telemetry reading for a session. Returns a normalized object
-// or null when absent / unreadable. NEVER throws.
+// Parse a RAW Claude Code statusline payload object into the normalized telemetry
+// shape (without freshness, which depends on the source's age). This is the
+// authoritative field mapping, on the consumer side (the shell entry does NO
+// parsing). No per-model / per-plan / per-window assumptions: every field is read
+// straight from the payload; absent fields are omitted/null, never fabricated.
+//   - context_window.used_percentage / context_window_size: computed by Claude Code
+//     for the active model+plan. used_percentage is null before the first API
+//     response and right after a compaction; never coerce a missing field to 0.
+//   - rate_limits is Pro/Max OAuth ONLY (omitted for API-key / Bedrock / Vertex).
+// Returns null when the payload is not a usable object.
+function parsePayload(d, sessionId) {
+  if (!d || typeof d !== 'object') return null;
+  const cw = (d.context_window && typeof d.context_window === 'object') ? d.context_window : {};
+  const contextPct = (typeof cw.used_percentage === 'number') ? cw.used_percentage : null;
+  const windowSize = (typeof cw.context_window_size === 'number') ? cw.context_window_size : null;
+  const rl = (d.rate_limits && typeof d.rate_limits === 'object') ? d.rate_limits : null;
+  const fiveH = (rl && rl.five_hour && typeof rl.five_hour.used_percentage === 'number')
+    ? rl.five_hour.used_percentage : undefined;
+  const sevenD = (rl && rl.seven_day && typeof rl.seven_day.used_percentage === 'number')
+    ? rl.seven_day.used_percentage : undefined;
+  const model = (d.model && typeof d.model.id === 'string') ? d.model.id : null;
+  const sid = (typeof d.session_id === 'string' && d.session_id)
+    ? d.session_id : (sessionId || 'default');
+  return {
+    sessionId: sid,
+    contextPct: contextPct,
+    usedPercentage: contextPct,
+    windowSize: windowSize,
+    fiveHourPct: fiveH,
+    sevenDayPct: sevenD,
+    model: model,
+    source: 'statusline',
+  };
+}
+
+// Read the latest telemetry reading for a session. Reads the RAW statusline payload
+// the shell entry wrote, parses it ON DEMAND, and returns a normalized object or
+// null when absent / unreadable. NEVER throws.
 //
 //   {
 //     sessionId, contextPct, usedPercentage, windowSize,
 //     fiveHourPct?, sevenDayPct?, model, ts, source, fresh
 //   }
 //
-// `fresh` is true only when contextPct is a finite number AND ts is within the
-// TTL, rejecting BOTH stale and far-future timestamps (Math.abs of the age).
+// Freshness comes from the raw file's modification time (the pure-shell entry writes
+// no timestamp into the payload). `fresh` is true only when contextPct is a finite
+// number AND the file's mtime is within the TTL, rejecting BOTH stale and far-future
+// times (Math.abs of the age). `ts` is the raw file's mtime as ISO, for visibility.
+//
+// Backward compatibility: if no raw file exists but a legacy parsed telemetry file
+// (telemetry-<session>.json with context_pct/ts) does, fall back to reading that, so
+// a consumer that stubs telemetry via writeTelemetry still works.
 function readTelemetry(sessionId, opts) {
-  let raw;
-  try {
-    raw = fs.readFileSync(telemetryPath(sessionId), 'utf8');
-  } catch (e) { return null; }
-
-  let d;
-  try { d = JSON.parse(raw); } catch (e) { return null; }
-  if (!d || typeof d !== 'object') return null;
-
   const ttl = ttlFrom(opts);
-  const contextPct = (typeof d.context_pct === 'number') ? d.context_pct : null;
 
+  // Off-hot-path raw-file hygiene: prune stale/excess raw files at most once per
+  // interval (cross-process throttled). Best-effort, never throws, runs before the
+  // read so a unique-id flood is bounded even if every read targets a new id.
+  pruneThrottled(false);
+
+  // Preferred path: the raw statusline payload written by the shell entry.
+  let rawStat;
+  try { rawStat = fs.statSync(rawPath(sessionId)); } catch (e) { rawStat = null; }
+  if (rawStat) {
+    let raw;
+    try { raw = fs.readFileSync(rawPath(sessionId), 'utf8'); } catch (e) { raw = null; }
+    if (raw != null) {
+      let d;
+      try { d = JSON.parse(raw); } catch (e) { d = null; }
+      const parsed = parsePayload(d, sessionId);
+      if (parsed) {
+        const ageSec = (Date.now() - rawStat.mtimeMs) / 1000;
+        const fresh = (typeof parsed.contextPct === 'number' && isFinite(parsed.contextPct))
+          ? (Math.abs(ageSec) <= ttl) : false;
+        let ts = null;
+        try { ts = new Date(rawStat.mtimeMs).toISOString(); } catch (e) { ts = null; }
+        parsed.ts = ts;
+        parsed.fresh = fresh;
+        return parsed;
+      }
+      // Raw file present but unparseable: return null (do not silently fall through
+      // to a stale legacy file, which would mask a live-but-corrupt reading).
+      return null;
+    }
+    return null;
+  }
+
+  // Legacy fallback: a parsed telemetry file written via writeTelemetry (carries its
+  // own ts). Kept so existing consumers/stubs that use writeTelemetry keep working.
+  let lraw;
+  try { lraw = fs.readFileSync(telemetryPath(sessionId), 'utf8'); } catch (e) { return null; }
+  let d;
+  try { d = JSON.parse(lraw); } catch (e) { return null; }
+  if (!d || typeof d !== 'object') return null;
+  const contextPct = (typeof d.context_pct === 'number') ? d.context_pct : null;
   let fresh = false;
   if (typeof contextPct === 'number' && isFinite(contextPct) && typeof d.ts === 'string') {
     const t = Date.parse(d.ts);
-    if (isFinite(t)) {
-      const ageSec = (Date.now() - t) / 1000;
-      // Reject stale (age > ttl) AND far-future (age < -ttl) timestamps; a small
-      // clock skew within the TTL is tolerated either way.
-      fresh = Math.abs(ageSec) <= ttl;
-    }
+    if (isFinite(t)) fresh = Math.abs((Date.now() - t) / 1000) <= ttl;
   }
-
   return {
     sessionId: (typeof d.session_id === 'string') ? d.session_id : (sessionId || 'default'),
     contextPct: contextPct,
@@ -128,10 +310,14 @@ function readTelemetry(sessionId, opts) {
 
 module.exports = {
   readTelemetry,
+  parsePayload,
   writeTelemetry,
   telemetryDir,
   telemetryPath,
+  rawPath,
   ensureDir,
+  pruneRaw,
+  pruneThrottled,
   nowIso,
   DEFAULT_TTL_SEC,
 };

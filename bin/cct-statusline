@@ -1,75 +1,156 @@
 #!/bin/sh
-# cc-context-telemetry - statusLine entry (the SAFE wrapper).
+# cc-context-telemetry - statusLine entry (the SAFE wrapper). PURE POSIX SHELL.
 #
 # Claude Code runs this as its statusLine command, with the session JSON on stdin,
-# every render. It:
-#   1. captures the payload to a temp file,
-#   2. runs the telemetry writer (a fast node process that parses + writes the
-#      per-session telemetry file and exits in milliseconds; it spawns nothing),
-#   3. in WRAP mode (env CCT_WRAP set to your original statusline command) EXECs that
-#      command with the SAME stdin, so THIS process BECOMES your statusline and Claude
-#      Code manages it exactly like a direct statusLine - no spawned, detached, or
-#      babysat child. In STANDALONE mode the telemetry writer already printed the
-#      minimal bar, so we just exit.
+# EVERY render. The hot path here is therefore deliberately Node-free: spawning a
+# Node process per render (tens of MB, ~100ms) across many concurrent sessions at
+# high render frequency piles up load and can take a machine down. So this entry
+# does only the minimum, in shell:
+#   1. read stdin ONCE into a temp file,
+#   2. extract session_id with a bounded sed (fall back to "default"),
+#   3. write the RAW payload to telemetry-raw-<session_id>.json (the ONLY write;
+#      all JSON parsing happens later, on demand, in the hook/consumer via index.js),
+#   4a. WRAP mode (env CCT_WRAP set): EXEC the wrapped command on the SAME stdin so
+#       THIS process BECOMES your statusline and Claude Code manages it exactly like
+#       a direct statusLine (no spawn, no detach, no babysat orphan), or
+#   4b. STANDALONE mode (no CCT_WRAP): print a minimal plain-text bar extracted from
+#       the payload in shell (no emoji), then exit 0. Never blank.
 #
 # WHY EXEC, NOT SPAWN: Claude Code kills the statusline process every render to keep
-# it bounded. Earlier versions spawned the wrapped command as a DETACHED child, so
-# killing the wrapper left the (often heavy) wrapped command alive every render - a
-# runaway process pile-up. EXEC makes the wrapped command BE the process Claude Code
-# kills, so it is torn down each render exactly as if run directly. No pile-up.
+# it bounded. EXEC makes the wrapped command BE the process Claude Code kills, so it
+# is torn down each render exactly as if run directly. No pile-up, no orphan.
 set -u
 
-# Resolve this script's directory so we can find the sibling telemetry.js, even via
-# a symlinked bin.
-SELF="$0"
-while [ -h "$SELF" ]; do
-  link=$(readlink "$SELF") || break
-  case "$link" in
-    /*) SELF="$link" ;;
-    *)  SELF="$(dirname "$SELF")/$link" ;;
-  esac
-done
-DIR="$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)"
-
-# Choose node: prefer an explicit override, else whatever is on PATH.
-NODE="${CCT_NODE:-node}"
-
-# Capture stdin to a temp file so both the telemetry writer and the EXEC'd statusline
-# get the EXACT same bytes.
-tmp="$(mktemp 2>/dev/null)" || tmp="${TMPDIR:-/tmp}/cct.$$.$(date +%s 2>/dev/null || echo 0)"
+# Capture stdin to a temp file ONCE so both the raw-telemetry write and the EXEC'd
+# statusline get the EXACT same bytes.
+#
+# WHY `cat` CANNOT HANG HERE (evidence, not assumption): a `cat` reading the statusLine
+# stdin only blocks if Claude Code never closes that stdin. We have direct evidence it
+# DOES close it: the `adtention` statusLine binary's `status` command does
+# `io.ReadAll(os.Stdin)`, which blocks until EOF, and it runs FLAT as a DIRECT
+# statusLine on every render with no pile-up (owner-confirmed in production). If Claude
+# Code did NOT close the statusLine's stdin, that direct `io.ReadAll` would hang EVERY
+# render and the renders would pile up - they do not - therefore Claude Code closes the
+# statusLine's stdin after its single bounded write. Our `cat` reads the IDENTICAL stdin
+# Claude Code hands the statusLine (the wrapper IS the statusLine via exec), so it gets
+# the IDENTICAL EOF and returns. We deliberately do NOT add a per-render read timeout or
+# a Node guard: that would reintroduce a per-render spawn (the exact pile-up this rewrite
+# removes), to "fix" a hang the evidence above shows cannot happen. The test harness
+# feeds a closing stdin to exercise this real EOF path.
+tmp="$(mktemp 2>/dev/null)" || tmp="${TMPDIR:-/tmp}/cct.$$"
 cat > "$tmp"
 
-# Telemetry write (fast, self-terminating, spawns nothing). Never let it break the
-# bar. In wrap mode it prints nothing; in standalone mode it prints the minimal bar.
-"$NODE" "$DIR/telemetry.js" < "$tmp" 2>/dev/null || true
+# Telemetry dir: CCT_DIR override, else ~/.claude/cc-context-telemetry. Mirror
+# index.js telemetryDir(). HOME may be unset in odd environments; tolerate it.
+dir="${CCT_DIR:-${HOME:-/tmp}/.claude/cc-context-telemetry}"
+
+# Extract the TOP-LEVEL "session_id" string in pure shell. Bounded: a single
+# non-greedy sed over one line of the (small) payload. Sanitize to [A-Za-z0-9_-] so a
+# hostile id cannot escape the dir, then mirror index.js sanitizeId so a reader
+# resolves the same filename: every char outside [A-Za-z0-9_-] becomes "_", and an
+# empty result falls back to "default" (NOT "shared" - the JS reader's empty-id
+# fallback is "default"; they must agree or a hook read would miss the file). For a
+# real session_id (an ASCII UUID: hex + hyphens) shell `tr` (byte-wise) and JS regex
+# (code-unit) agree EXACTLY. An exotic non-ASCII id may map to a different name in the
+# two (tr counts bytes, JS counts UTF-16 units), but BOTH stay contained inside the
+# dir - the worst case is a fail-safe read-miss, never a path escape.
+sid="$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)"
+sid="$(printf '%s' "$sid" | tr -c 'A-Za-z0-9_-' '_' )"
+[ -n "$sid" ] || sid="default"
+
+# Write the RAW payload for on-demand parsing by the consumer. Per session, so the
+# file count is bounded by live sessions (the reader prunes stale ones, see
+# index.js). Best-effort: a failed mkdir/write must never break the bar.
+#
+# ATOMIC: write to a temp file IN THE SAME DIR, then `mv` (rename) over the final
+# name. POSIX rename within a filesystem is atomic, so a concurrent on-demand reader
+# sees either the old complete file or the new complete file, never a half-written
+# one. (cp alone writes in place and a reader could catch a partial file; the reader
+# tolerates that by returning null on a parse error, but the atomic rename removes
+# the race entirely.) The temp uses $$ so concurrent renders for the SAME session do
+# not clobber each other's temp; the final rename is last-writer-wins, which is
+# correct (newest render's payload wins).
+mkdir -p "$dir" 2>/dev/null || true
+raw_final="$dir/telemetry-raw-$sid.json"
+raw_tmp="$dir/.telemetry-raw-$sid.$$.tmp"
+if cp "$tmp" "$raw_tmp" 2>/dev/null; then
+  mv -f "$raw_tmp" "$raw_final" 2>/dev/null || rm -f "$raw_tmp" 2>/dev/null || true
+fi
 
 # WRAP mode: become the user's statusline. Use fd 3 so the temp file can be unlinked
 # immediately (no temp litter); eval honors the shell quoting in CCT_WRAP.
 if [ -n "${CCT_WRAP:-}" ] && [ -n "$(printf '%s' "${CCT_WRAP:-}" | tr -d '[:space:]')" ]; then
   exec 3< "$tmp"
   rm -f "$tmp"
-  # `eval` so a quoted command string ("'/path/adtention' status") is parsed, then
-  # `exec` so a SIMPLE command (the normal statusLine - a program plus args) is exec'd
-  # DIRECTLY and BECOMES the statusline process: no intermediate shell, so killing it
-  # (as Claude Code does every render) tears it down. The crucial safety property is
-  # that we NEVER detach - the catastrophic pile-up that this package previously had
-  # required a child severed into its OWN session (it survived the render-kill and
-  # accumulated). Here the exec'd command (and any children it spawns) stay in the
-  # statusline process's own session, managed exactly as a direct statusLine.
+  # `eval` parses a quoted command string ("'/path/adtention' status"); `exec` then
+  # replaces THIS shell with that command so it BECOMES the statusline process. When
+  # Claude Code kills the statusline every render, the exec'd command (and any
+  # children in its session) are torn down too. We deliberately do NOT route through
+  # `sh -c "$CCT_WRAP"` (which may FORK and leave an orphan on a per-render kill), and
+  # we NEVER detach (the old catastrophic pile-up required a detached child that
+  # survived the render-kill).
   #
-  # We deliberately do NOT route through `sh -c "$CCT_WRAP"`: on shells where `sh -c`
-  # does not exec-optimize a single command it would FORK the command under a shell,
-  # and a per-render PID-kill would orphan it - reintroducing a leak for the COMMON
-  # (simple-command) case. CCT_WRAP is meant to be a single foreground command (the
-  # normal statusLine shape). A CCT_WRAP that backgrounds with a trailing `&` would
-  # leave that process running past the render - exactly as it would run directly; do
-  # not background your statusLine.
+  # Do NOT background your statusLine with a trailing `&`: a statusLine that backgrounds
+  # a helper which outlives the front pid leaks that helper on EVERY render-kill - and
+  # it leaks IDENTICALLY under direct use and under this wrapper. Because exec makes the
+  # wrapped command BECOME the process Claude Code kills, the process tree is the same as
+  # running it directly, so the wrapper adds NO extra orphan; the leak is the forking
+  # statusline's own foot-gun, not the wrapper's. test/loadrepro proves this with a
+  # forking callee run both ways: the orphan counts are EQUAL (FDIR == FWRP).
   eval "exec ${CCT_WRAP} <&3"
-  # exec replaces this shell on success. A missing command exits 127 (blank bar that
-  # render, self-evident); we NEVER spawn a fallback. Below is a normally-unreachable
-  # defensive no-op.
+  # exec replaces this shell on success. A missing command exits 127 (blank that one
+  # render, self-evident); we NEVER spawn a fallback. Defensive no-op below.
   exit 0
 fi
 
+# STANDALONE mode (no CCT_WRAP): print a minimal plain-text bar from a cheap shell
+# extraction of the payload. No emoji (project rule). Never blank.
+#
+# Extract context_window.used_percentage and rate_limits 5h/7d used_percentage. The
+# payload nests used_percentage under several keys, so we scope each match to its
+# object: context % is the used_percentage INSIDE the context_window object; 5h/7d are
+# INSIDE rate_limits.five_hour / seven_day. We match the smallest object span per key.
+# A number may be int or float, possibly null. Bounded sed over the small one-line
+# payload; on no match the field is "--" (never fabricated, never blanked).
+extract_pct() {
+  # $1 = the JSON object key (e.g. context_window, five_hour). Prints a rounded int %,
+  # or empty if absent/null. Finds the key, then the FIRST used_percentage number after
+  # it. Bounded: operates on the single payload buffer, no loops.
+  #
+  # STANDALONE-DISPLAY-ONLY parser, with KNOWN, DELIBERATE assumptions (this is a cheap
+  # shell bar, NOT the authoritative reader):
+  #   - assumes the payload is ONE line (Claude Code emits a single-line statusline
+  #     JSON); a pretty-printed / multi-line payload would not match -> "--".
+  #   - assumes used_percentage sits DIRECTLY inside the named object's first `{...}`
+  #     span: the `[^}]*` stops at the first `}`, so a nested object BEFORE
+  #     used_percentage inside that object (e.g. {"foo":{...},"used_percentage":47})
+  #     would not match -> "--".
+  #   - assumes a plain decimal value; scientific notation (1e2), +/- signs, etc. are
+  #     not matched -> "--".
+  # On ANY of these the field is "--", never fabricated and never a blank bar - a
+  # conservative, fail-soft display miss. We do NOT over-engineer this shell parser:
+  # the AUTHORITATIVE consumer path is index.js (real JSON.parse via readTelemetry),
+  # which is robust to all of the above; this standalone bar only renders when no
+  # CCT_WRAP is set and is purely cosmetic.
+  key="$1"
+  # Pull the substring starting at the key, then grab the first used_percentage value.
+  sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*{[^}]*"used_percentage"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\(\.[0-9]*\)\{0,1\}\).*/\1/p' "$tmp" 2>/dev/null | head -n 1
+}
+# Round a decimal string to an integer with awk (present on every POSIX system). Empty
+# in -> empty out.
+round_pct() {
+  v="$1"
+  [ -n "$v" ] || { printf ''; return; }
+  awk -v x="$v" 'BEGIN{ printf "%d", x + 0.5 }' 2>/dev/null
+}
+
+ctx="$(round_pct "$(extract_pct context_window)")"
+h5="$(round_pct "$(extract_pct five_hour)")"
+d7="$(round_pct "$(extract_pct seven_day)")"
 rm -f "$tmp"
+
+if [ -n "$ctx" ]; then bar="ctx ${ctx}%"; else bar="ctx --"; fi
+[ -n "$h5" ] && bar="$bar | 5h ${h5}%"
+[ -n "$d7" ] && bar="$bar | 7d ${d7}%"
+printf '%s' "$bar"
 exit 0
