@@ -7,40 +7,44 @@ zero-dependency library bridges that gap: it is a statusLine wrapper that captur
 Claude Code's authoritative telemetry, writes it to a per-session file your hooks
 can read, and passes through to your existing statusline so you keep your bar.
 
-One job, two pieces:
+One job, three pieces:
 
-- `bin/statusline.js` - the wrapper Claude Code calls as its statusLine. Writes
-  `telemetry-<session>.json`, then runs your original statusline (env `CCT_WRAP`)
-  and forwards its output verbatim. If no wrapper is set (or it fails), it prints
-  a minimal standalone bar so the segment is never blank.
-- `index.js` - `readTelemetry(sessionId)` for your hooks to read the latest
-  reading, with a freshness check.
+- `bin/cct-statusline` - the POSIX shell entry Claude Code calls as its statusLine.
+  It captures the payload, runs the telemetry writer, and then - if `CCT_WRAP` is set
+  to your original statusline command - **`exec`s that command** so it BECOMES the
+  statusLine process (see Process handling for why this matters). In standalone mode
+  it prints a minimal bar so the segment is never blank.
+- `bin/telemetry.js` - the telemetry writer. A fast node process that parses the
+  payload, writes `telemetry-<session>.json`, and exits. It spawns nothing.
+- `index.js` - `readTelemetry(sessionId)` for your hooks to read the latest reading,
+  with a freshness check.
 
-Zero third-party dependencies. Node >= 18. CommonJS. Never throws, never blanks
-the bar, never calls `claude`.
+Zero third-party dependencies. Node >= 18. POSIX shell (Linux/macOS). Never throws,
+never calls `claude`.
 
 ## Wiring
 
-Add this to `~/.claude/settings.json` (use an absolute path to the installed bin,
-or the `cc-context-telemetry-statusline` command if installed globally):
+Add this to `~/.claude/settings.json` (use an absolute path to the entry script, or
+the `cc-context-telemetry-statusline` command if installed globally):
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "node /absolute/path/to/cc-context-telemetry/bin/statusline.js"
+    "command": "/absolute/path/to/cc-context-telemetry/bin/cct-statusline"
   }
 }
 ```
 
-To keep your existing bar, point `CCT_WRAP` at your original statusline command.
-The wrapper runs it with the same stdin and forwards its output verbatim:
+To keep your existing bar, point `CCT_WRAP` at your original statusline command. The
+entry `exec`s it with the same stdin so you keep your bar, and Claude Code manages it
+exactly as if it were your statusLine directly:
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "node /absolute/path/to/cc-context-telemetry/bin/statusline.js",
+    "command": "/absolute/path/to/cc-context-telemetry/bin/cct-statusline",
     "env": {
       "CCT_WRAP": "node /absolute/path/to/your/original-statusline.js"
     }
@@ -48,8 +52,9 @@ The wrapper runs it with the same stdin and forwards its output verbatim:
 }
 ```
 
-(If your Claude Code version does not support an `env` block on `statusLine`,
-export `CCT_WRAP` in your shell profile instead.)
+(If your Claude Code version does not support an `env` block on `statusLine`, export
+`CCT_WRAP` in your shell profile instead. If `node` is not on the PATH Claude Code
+uses, set `CCT_NODE` to its absolute path.)
 
 ## Consumer API (hooks)
 
@@ -117,14 +122,16 @@ compaction.
 
 ## Environment variables
 
-- `CCT_WRAP` - your original statusline command. The wrapper runs it with the same
-  stdin and forwards its output verbatim. When unset, the wrapper prints its own
-  minimal bar (`ctx 47% | 5h 12% | 7d 30%`).
-- `CCT_WRAP_TIMEOUT_MS` - timeout in milliseconds for the wrapped command (default
-  5000). On timeout the wrapper SIGKILLs the wrapped command's ENTIRE process group
-  (not just the shell) so a command that shells out leaves no orphaned children, and
-  the bar still prints. The wrapper ALWAYS exits by this deadline at the latest, even
-  if the wrapped command daemonizes and holds the pipe open (see Process handling).
+- `CCT_WRAP` - your original statusline command, as a SINGLE foreground command (a
+  program plus args, e.g. `'/path/to/your-statusline' status`). The entry `exec`s it
+  with the same stdin so it becomes the statusLine process and forwards its output. It
+  must NOT be a pipeline (`a | b`) or backgrounded (trailing `&`): a pipeline mis-routes
+  stdin, and `&` leaves a process running past the render (exactly as it would running
+  directly). If you need a pipeline, put it in a small script and point `CCT_WRAP` at
+  that script. When `CCT_WRAP` is unset, the entry prints its own minimal bar
+  (`ctx 47% | 5h 12% | 7d 30%`).
+- `CCT_NODE` - absolute path to the `node` binary, if `node` is not on the PATH that
+  Claude Code uses to run the statusLine. Defaults to `node`.
 - `CCT_DIR` - telemetry directory (default `~/.claude/cc-context-telemetry/`).
 - `CCT_TTL_SEC` - freshness window for `readTelemetry` in seconds (default 120).
 - `CCT_DEBUG` - when set to a truthy value (e.g. `1`, `true`, `yes`), the wrapper
@@ -138,24 +145,25 @@ compaction.
 
 ## Process handling (why the wrapper is safe to run every render)
 
-Claude Code runs the statusLine command on every render, in every open session. A
-wrapper that runs your original statusline command (`CCT_WRAP`) must therefore be
-disciplined about the processes it starts, or they pile up. This wrapper guarantees:
+Claude Code runs the statusLine command on every render, in every open session, and
+keeps it bounded by killing that per-render process. So a wrapper around your existing
+statusline must let Claude Code manage your statusline's lifecycle exactly as it would
+directly - or the wrapped command piles up.
 
-- It runs the wrapped command in its OWN process group and, on timeout or output
-  overflow, SIGKILLs the WHOLE group. A wrapped statusline that shells out to helper
-  commands leaves NO orphaned children. (Killing only the direct shell, as a naive
-  `spawnSync` timeout does, orphans those helpers; across many renders and sessions
-  that accumulates.)
-- The wrapper ALWAYS exits, by the `CCT_WRAP_TIMEOUT_MS` deadline at the latest. It
-  never waits indefinitely on the wrapped command's output, so it cannot freeze your
-  bar or leave a stuck process behind per render.
+This entry `exec`s your `CCT_WRAP` command: the entry process **becomes** your
+statusline, so the process Claude Code spawns and later kills IS your statusline. It is
+torn down each render just like running it directly - no extra long-lived process, no
+pile-up.
 
-One limit, by OS design: if your wrapped command DELIBERATELY daemonizes a helper
-(double-fork / `setsid` / `nohup ... &`), that helper detaches into its own session
-and the wrapper cannot kill it - exactly as if you ran that command as your statusLine
-directly, without this wrapper. The wrapper still exits promptly; only the helper your
-own command intentionally backgrounded keeps running.
+It does NOT spawn your statusline as a child and babysit it. Spawning a child (detached
+or not) from a per-render process is unsafe: when Claude Code kills the wrapper, the
+spawned statusline can survive, and a heavy statusline (one that itself shells out)
+then leaks an instance every render until the machine is overloaded. `exec`, not spawn,
+is what makes wrapping safe. (Versions before 0.2.0 spawned; do not use them.)
+
+The only added process is the telemetry writer - a fast node process that parses the
+payload, writes one small file, and exits in milliseconds. It spawns nothing and cannot
+accumulate.
 
 ## Verify it works (one cheap session)
 
@@ -163,7 +171,7 @@ The wrapper has been tested against stub payloads. To confirm it parses Claude
 Code's REAL statusline payload, one short session is enough (the statusline
 renders every turn, so there is no need to fill the context):
 
-1. Wire `bin/statusline.js` as your `statusLine` (see Wiring above) and set
+1. Wire `bin/cct-statusline` as your `statusLine` (see Wiring above) and set
    `CCT_DEBUG=1` so the raw payload is also dumped. Add `CCT_WRAP` (your original
    statusline command) so you keep your existing bar during the test. For example:
 
@@ -171,7 +179,7 @@ renders every turn, so there is no need to fill the context):
    {
      "statusLine": {
        "type": "command",
-       "command": "node /absolute/path/to/cc-context-telemetry/bin/statusline.js",
+       "command": "/absolute/path/to/cc-context-telemetry/bin/cct-statusline",
        "env": {
          "CCT_WRAP": "node /absolute/path/to/your/original-statusline.js",
          "CCT_DEBUG": "1"

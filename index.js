@@ -3,9 +3,10 @@
 //
 // Claude Code hooks and plugins cannot see context fullness or rate limits. The
 // ONLY place Claude Code exposes the AUTHORITATIVE context_window /
-// rate_limits is the statusLine command. The statusline wrapper (bin/statusline.js)
-// captures that telemetry and writes it to a per-session file. This module is the
-// reader: a hook calls readTelemetry(sessionId) to get the latest reading.
+// rate_limits is the statusLine command. The statusLine entry (bin/cct-statusline)
+// and its telemetry writer (bin/telemetry.js) capture that telemetry and write it to
+// a per-session file. This module is the reader: a hook calls readTelemetry(sessionId)
+// to get the latest reading.
 //
 // CONTRACT: never throws. readTelemetry returns a normalized object or null.
 const fs = require('fs');

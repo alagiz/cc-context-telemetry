@@ -1,0 +1,75 @@
+#!/bin/sh
+# cc-context-telemetry - statusLine entry (the SAFE wrapper).
+#
+# Claude Code runs this as its statusLine command, with the session JSON on stdin,
+# every render. It:
+#   1. captures the payload to a temp file,
+#   2. runs the telemetry writer (a fast node process that parses + writes the
+#      per-session telemetry file and exits in milliseconds; it spawns nothing),
+#   3. in WRAP mode (env CCT_WRAP set to your original statusline command) EXECs that
+#      command with the SAME stdin, so THIS process BECOMES your statusline and Claude
+#      Code manages it exactly like a direct statusLine - no spawned, detached, or
+#      babysat child. In STANDALONE mode the telemetry writer already printed the
+#      minimal bar, so we just exit.
+#
+# WHY EXEC, NOT SPAWN: Claude Code kills the statusline process every render to keep
+# it bounded. Earlier versions spawned the wrapped command as a DETACHED child, so
+# killing the wrapper left the (often heavy) wrapped command alive every render - a
+# runaway process pile-up. EXEC makes the wrapped command BE the process Claude Code
+# kills, so it is torn down each render exactly as if run directly. No pile-up.
+set -u
+
+# Resolve this script's directory so we can find the sibling telemetry.js, even via
+# a symlinked bin.
+SELF="$0"
+while [ -h "$SELF" ]; do
+  link=$(readlink "$SELF") || break
+  case "$link" in
+    /*) SELF="$link" ;;
+    *)  SELF="$(dirname "$SELF")/$link" ;;
+  esac
+done
+DIR="$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)"
+
+# Choose node: prefer an explicit override, else whatever is on PATH.
+NODE="${CCT_NODE:-node}"
+
+# Capture stdin to a temp file so both the telemetry writer and the EXEC'd statusline
+# get the EXACT same bytes.
+tmp="$(mktemp 2>/dev/null)" || tmp="${TMPDIR:-/tmp}/cct.$$.$(date +%s 2>/dev/null || echo 0)"
+cat > "$tmp"
+
+# Telemetry write (fast, self-terminating, spawns nothing). Never let it break the
+# bar. In wrap mode it prints nothing; in standalone mode it prints the minimal bar.
+"$NODE" "$DIR/telemetry.js" < "$tmp" 2>/dev/null || true
+
+# WRAP mode: become the user's statusline. Use fd 3 so the temp file can be unlinked
+# immediately (no temp litter); eval honors the shell quoting in CCT_WRAP.
+if [ -n "${CCT_WRAP:-}" ] && [ -n "$(printf '%s' "${CCT_WRAP:-}" | tr -d '[:space:]')" ]; then
+  exec 3< "$tmp"
+  rm -f "$tmp"
+  # `eval` so a quoted command string ("'/path/adtention' status") is parsed, then
+  # `exec` so a SIMPLE command (the normal statusLine - a program plus args) is exec'd
+  # DIRECTLY and BECOMES the statusline process: no intermediate shell, so killing it
+  # (as Claude Code does every render) tears it down. The crucial safety property is
+  # that we NEVER detach - the catastrophic pile-up that this package previously had
+  # required a child severed into its OWN session (it survived the render-kill and
+  # accumulated). Here the exec'd command (and any children it spawns) stay in the
+  # statusline process's own session, managed exactly as a direct statusLine.
+  #
+  # We deliberately do NOT route through `sh -c "$CCT_WRAP"`: on shells where `sh -c`
+  # does not exec-optimize a single command it would FORK the command under a shell,
+  # and a per-render PID-kill would orphan it - reintroducing a leak for the COMMON
+  # (simple-command) case. CCT_WRAP is meant to be a single foreground command (the
+  # normal statusLine shape). A CCT_WRAP that backgrounds with a trailing `&` would
+  # leave that process running past the render - exactly as it would run directly; do
+  # not background your statusLine.
+  eval "exec ${CCT_WRAP} <&3"
+  # exec replaces this shell on success. A missing command exits 127 (blank bar that
+  # render, self-evident); we NEVER spawn a fallback. Below is a normally-unreachable
+  # defensive no-op.
+  exit 0
+fi
+
+rm -f "$tmp"
+exit 0
