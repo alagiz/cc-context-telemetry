@@ -1,7 +1,6 @@
 # cc-context-telemetry
 
 [![npm](https://img.shields.io/npm/v/cc-context-telemetry)](https://www.npmjs.com/package/cc-context-telemetry)
-[![downloads](https://img.shields.io/npm/dm/cc-context-telemetry)](https://www.npmjs.com/package/cc-context-telemetry)
 [![license](https://img.shields.io/npm/l/cc-context-telemetry)](./LICENSE)
 
 Show Claude Code's context % and Pro/Max rate-limit usage right next to your
