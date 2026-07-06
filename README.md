@@ -225,7 +225,7 @@ field paths Claude Code sent.
 
 See the [`examples/`](examples/) directory for complete, runnable files: a
 copy-pasteable PreToolUse warning hook (`pretooluse-warn.js`) and a telemetry
-printer for the live check (`print-telemetry.js`). The examples are not shipped to
+printer for the live check (`print-telemetry.js`). The examples are not published to
 npm.
 
 ## License

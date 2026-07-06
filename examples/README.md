@@ -4,11 +4,11 @@ Small, complete, runnable examples for cc-context-telemetry. Each requires the
 lib via a relative path (`../index.js`) so it runs straight from this repo; an
 npm-installed consumer would use `require('cc-context-telemetry')` instead.
 
-These examples are NOT shipped to npm (the package `files` allowlist ships only
+These examples are NOT published to npm (the package `files` allowlist includes only
 `index.js`, `bin/`, `README.md`, and `LICENSE`).
 
 Note: `bin/telemetry.js` is the same on-demand reader as `print-telemetry.js` (it
-also reads `readTelemetry`), exposed as a shipped CLI; the example is kept here as a
+also reads `readTelemetry`), exposed as an installed CLI; the example is kept here as a
 copy-pasteable standalone.
 
 ## pretooluse-warn.js

@@ -165,7 +165,7 @@ EOF
 chmod +x "$OLDWRAP"
 
 # The NEW wrapper: the REAL bin/cct-statusline, exec-through to the callee. We do not
-# re-implement it; we use the shipped entry so the harness proves the ACTUAL code.
+# re-implement it; we use the real entry so the harness proves the ACTUAL code.
 
 # ---- one "render" of a shape: start the front process on a CLOSING stdin, then
 #      KILL THE FRONT PID mid-render (KILL_AFTER_MS), as Claude Code does. -------
