@@ -10,49 +10,19 @@ limit resets, right next to your existing statusline bar.
 
     after:    ctx 48% | 5h 14% ~3h20m | 7d 50% ~4d   ~/code/myapp  main
 
-The trailing part (`~/code/myapp  main` here) is whatever your own statusline already
-prints - cct wraps ANY statusline command, not a specific one. A busier bar wraps the
-same way: e.g. the adtention plugin's `main  $9.07  21:04` becomes
-`ctx 48% | 5h 14% ~3h20m | 7d 50% ~4d   main  $9.07  21:04`.
-
-Claude Code hooks and plugins cannot see context fullness or rate limits. The ONLY
-place Claude Code exposes the authoritative `context_window` (used percentage, window
-size) and Pro/Max `rate_limits` is the `statusLine` command. This tiny, zero-dependency
-library bridges that gap: a statusLine wrapper that prepends a compact
-`ctx % | 5h % | 7d %` segment (each rate-limit field carrying a `~time-left` countdown to
-its reset) to your own bar and also writes that telemetry to a per-session file your hooks
-can read.
-
-One job, three pieces:
-
-- `bin/cct-statusline` - the POSIX shell entry Claude Code calls as its statusLine,
-  every render. It is **pure shell, with NO Node on the per-render path**: it reads the
-  payload once, extracts the session id, and atomically writes the RAW payload to
-  `telemetry-raw-<session>.json`. Then it prints a compact `ctx % | 5h % | 7d %`
-  segment (each rate-limit field carrying a `~time-left` countdown to its reset) and, if
-  `CCT_WRAP` is set to your original statusline command, **`exec`s that
-  command** so its bar appends right after the segment on the same line and it BECOMES
-  the statusLine process (see Process handling for why this matters); with no `CCT_WRAP`
-  the segment is the whole bar, never blank. There is no per-render Node spawn at all (an
-  earlier design spawned `node` every render; across many sessions that piled up - see
-  Process handling).
-- `index.js` - the consumer. `readTelemetry(sessionId)` reads the raw payload file,
-  parses it ON DEMAND, and returns the latest reading with a freshness check. So all
-  JSON parsing happens here, only when a hook actually asks - never on the hot path. It
-  also prunes stale per-session raw files (off the hot path, throttled).
-- `bin/telemetry.js` - an on-demand CLI reader over `readTelemetry`, for the manual
-  live check. It is NOT in the per-render path; it runs only when you invoke it.
-
-Zero third-party dependencies. Node >= 18. POSIX shell (Linux/macOS). Never throws,
-never calls `claude`.
+The trailing part is whatever your own statusline already prints - cct wraps ANY
+statusline command, not a specific one (a busier bar, like the adtention plugin's
+`main  $9.07  21:04`, gets the same segment prepended).
 
 ## Quick start
+
+Install:
 
 ```bash
 npm i -g cc-context-telemetry
 ```
 
-Wire it as your `statusLine` in `~/.claude/settings.json`, pointing `CCT_WRAP` at your
+Wire it as your `statusLine` in `~/.claude/settings.json`, with `CCT_WRAP` set to your
 current statusline command so the segment shows in front of your bar:
 
 ```json
@@ -65,14 +35,44 @@ current statusline command so the segment shows in front of your bar:
 }
 ```
 
-Done - your bar now starts with `ctx % | 5h % | 7d %`. With no `CCT_WRAP` the segment is
-your whole bar. (Prefer a stable absolute path? Point `command` at an installed or
-checked-out `bin/cct-statusline` instead of the global shim.)
+Done - your bar now starts with the `ctx % | 5h % | 7d %` segment. With no `CCT_WRAP` the
+segment is your whole bar. (Prefer a stable absolute path? Point `command` at an installed
+or checked-out `bin/cct-statusline` instead of the global shim. On a Claude Code that does
+not accept an `env` block on `statusLine`, export `CCT_WRAP` in your shell profile instead.)
 
-(If your Claude Code version does not support an `env` block on `statusLine`, export
-`CCT_WRAP` in your shell profile instead. The per-render path is pure shell, so no
-`node` needs to be on Claude Code's PATH for the wrapper itself - only your `CCT_WRAP`
-command and your hooks need their own interpreters.)
+> That is all you need for the bar. The rest is optional: how it works, then the API for
+> hooks and plugins that read this telemetry.
+
+## How it works
+
+Claude Code hooks and plugins cannot see context fullness or rate limits. The ONLY place
+Claude Code exposes the authoritative `context_window` (used percentage, window size) and
+Pro/Max `rate_limits` is the `statusLine` command. This tiny, zero-dependency library
+bridges that gap: a statusLine wrapper that prepends the `ctx % | 5h % | 7d %` segment
+(each rate-limit field carrying a `~time-left` countdown to its reset) to your own bar and
+also writes that telemetry to a per-session file your hooks can read.
+
+One job, three pieces:
+
+- `bin/cct-statusline` - the POSIX shell entry Claude Code calls as its statusLine,
+  every render. It is **pure shell, with NO Node on the per-render path**: it reads the
+  payload once, extracts the session id, and atomically writes the RAW payload to
+  `telemetry-raw-<session>.json`. Then it prints the `ctx % | 5h % | 7d %` segment (each
+  rate-limit field carrying a `~time-left` countdown to its reset) and, if `CCT_WRAP` is
+  set to your original statusline command, **`exec`s that command** so its bar appends
+  right after the segment on the same line and it BECOMES the statusLine process (see
+  "Safe to run every render" for why this matters); with no `CCT_WRAP` the segment is the
+  whole bar, never blank. There is no per-render Node spawn at all (an earlier design
+  spawned `node` every render; across many sessions that piled up).
+- `index.js` - the consumer. `readTelemetry(sessionId)` reads the raw payload file,
+  parses it ON DEMAND, and returns the latest reading with a freshness check. So all
+  JSON parsing happens here, only when a hook actually asks - never on the hot path. It
+  also prunes stale per-session raw files (off the hot path, throttled).
+- `bin/telemetry.js` - an on-demand CLI reader over `readTelemetry`, for the manual
+  live check. It is NOT in the per-render path; it runs only when you invoke it.
+
+Zero third-party dependencies. Node >= 18. POSIX shell (Linux/macOS). Never throws, never
+calls `claude`.
 
 ## Consumer API (hooks)
 
@@ -191,94 +191,35 @@ payload, so it doubles as the debug dump: inspect it directly to see the real fi
 paths Claude Code sent. It may contain real session content and is overwritten each
 render; the reader auto-prunes it (see Raw-file hygiene).
 
-## Process handling (why the wrapper is safe to run every render)
+## Safe to run every render
 
-Claude Code runs the statusLine command on every render, in every open session, and
-keeps it bounded by killing that per-render process. So a wrapper around your existing
-statusline must let Claude Code manage your statusline's lifecycle exactly as it would
-directly - or the wrapped command piles up.
+Claude Code runs your statusLine on every render in every session and kills that process
+each time to keep it bounded. cct stays safe by `exec`-ing your `CCT_WRAP` command: the
+entry process BECOMES your statusline, so what Claude Code spawns and kills IS your
+statusline, torn down each render exactly as if you ran it directly - no extra process, no
+pile-up. There is also NO Node on the per-render path (only shell; all JSON parsing happens
+later, on demand, in `index.js`), so nothing can outlive a render and orphan. An earlier
+design that spawned `node` every render orphaned under Claude Code's render-kills and piled
+up; the current exec-through wrapper does not. `test/loadrepro` proves it.
 
-This entry `exec`s your `CCT_WRAP` command: the entry process **becomes** your
-statusline, so the process Claude Code spawns and later kills IS your statusline. It is
-torn down each render just like running it directly - no extra long-lived process, no
-pile-up.
+Full rationale (exec vs spawn, the orphan incident, the stdin/EOF contract, and the
+forking-statusline corollary): [docs/process-safety.md](docs/process-safety.md).
 
-It does NOT spawn your statusline as a child and babysit it. Spawning a child (detached
-or not) from a per-render process is unsafe: when Claude Code kills the wrapper, the
-spawned statusline can survive, and a heavy statusline (one that itself shells out)
-then leaks an instance every render until the machine is overloaded. `exec`, not spawn,
-is what makes wrapping safe. (Versions before 0.2.0 spawned; do not use them.)
+## Verify it works
 
-A corollary: do NOT make YOUR wrapped statusline background a helper (a trailing `&` or
-a detached child that outlives the front process). Such a statusline leaks that helper
-on every render-kill - but it leaks IDENTICALLY whether you run it directly or through
-this wrapper. Because `exec` makes your command BECOME the process Claude Code kills, the
-process tree is the same as running it directly, so the wrapper introduces no extra
-orphan; the leak is the forking statusline's own foot-gun. `test/loadrepro` proves this
-with a forking callee run both ways and asserts the orphan counts are EQUAL.
+Wire it (Quick start), open any session, and send ONE message - the statusline renders
+every turn, so you do not need to fill the context. (Settings changes only take effect in
+a FRESH session, so start a new one after saving.) Then print the parsed reading:
 
-There is also NO Node process on the per-render path. An earlier design ran a small
-`node` telemetry writer every render. When Claude Code killed the statusline's front
-process while that node child was still running, the node child reparented to init and
-SURVIVED - one orphan per render, times many concurrent sessions, times a high render
-rate, which piled up. The rewrite moved all JSON parsing off the hot path (the shell
-entry only writes the raw payload; `index.js` parses on demand), so the per-render path
-is pure shell and spawns nothing that can outlive the render. `test/loadrepro` is a
-synthetic, self-cleaning harness that reproduces the old node-per-render orphan pile-up
-and asserts the current exec-through wrapper leaves nothing behind.
+```bash
+node examples/print-telemetry.js <session-id>
+```
 
-The entry reads stdin with a plain `cat` and NO timeout, relying on Claude Code closing
-the statusLine's stdin after a single bounded write (the same contract a direct
-statusLine command sees). This is not an assumption: the `adtention` statusLine binary
-reads its stdin with `io.ReadAll(os.Stdin)` (which blocks until EOF) and runs flat as a
-DIRECT statusLine with no pile-up, so if Claude Code did not close the statusLine stdin a
-direct `adtention` would hang every render - it does not, so Claude Code closes it, and
-our `cat` (reading the identical stdin) gets the identical EOF. We deliberately avoid a
-per-render timeout subprocess because that would reintroduce the per-render spawn this
-rewrite removed. If a future Claude Code build ever held statusLine stdin open, the
-`cat` would block - so confirm the EOF behavior on your Claude Code version with the one
-cheap session below before trusting it in long autonomous runs.
-
-## Verify it works (one cheap session)
-
-The wrapper has been tested against stub payloads. To confirm it parses Claude
-Code's REAL statusline payload, one short session is enough (the statusline
-renders every turn, so there is no need to fill the context):
-
-1. Wire `bin/cct-statusline` as your `statusLine` (see Wiring above). Add `CCT_WRAP`
-   (your original statusline command) so you keep your existing bar during the test.
-   For example:
-
-   ```json
-   {
-     "statusLine": {
-       "type": "command",
-       "command": "/absolute/path/to/cc-context-telemetry/bin/cct-statusline",
-       "env": {
-         "CCT_WRAP": "node /absolute/path/to/your/original-statusline.js"
-       }
-     }
-   }
-   ```
-
-   (If your Claude Code version does not support an `env` block on `statusLine`,
-   export `CCT_WRAP` in your shell profile instead.) Without `CCT_WRAP`, the minimal
-   standalone `ctx ..%` bar REPLACES your existing bar for the duration of the test;
-   remove the test wiring (or set `CCT_WRAP`) to get it back. Editing `settings.json`
-   only takes effect in a FRESH session, so start a new one after saving.
-
-2. Open any session and send ONE message. The statusline runs that turn.
-
-3. Run `node examples/print-telemetry.js <session-id>` to print the parsed reading
-   as pretty JSON; check for sane values (a numeric or null `contextPct`, a
-   `windowSize`, a `model`). Your session id is the `session_id` field in any hook
-   payload, and it is the `<session>` in the raw file written this session (the only
-   `telemetry-raw-*.json` for this session, under
-   `~/.claude/cc-context-telemetry/`).
-
-4. If the values are null or missing, inspect the raw file itself
-   (`~/.claude/cc-context-telemetry/telemetry-raw-<session>.json`), which IS the
-   verbatim statusline payload, to see the real field paths Claude Code sent.
+Check for sane values (a numeric or null `contextPct`, a `windowSize`, a `model`). Your
+`<session-id>` is the `session_id` field in any hook payload, and the `<session>` in the
+raw file written this session under `~/.claude/cc-context-telemetry/`. If values are null
+or missing, open that raw file - it IS the verbatim statusline payload - to see the real
+field paths Claude Code sent.
 
 ## Examples
 
