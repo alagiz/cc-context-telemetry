@@ -97,9 +97,23 @@ fi
 # of "\"key\"" (with quotes) does not match "context_window_size". DISPLAY-ONLY and
 # fail-soft: never fabricates, never blanks. The AUTHORITATIVE path remains index.js
 # (real JSON.parse via readTelemetry); this segment is cosmetic.
-seg="$(awk '
-  # Return the text INSIDE key '"'"'s object, bounded by its matching braces (so the
-  # search can never bleed into a later sibling object like rate_limits).
+#
+# TIME-LEFT: for 5h/7d we also read "resets_at" (a Unix epoch, seconds) from the same
+# object and render a compact "~<time-left>" countdown (resets_at - now). now comes from
+# CCT_NOW when set (a deterministic test seam, unused in production) else `date +%s`. It
+# is a pure DURATION, so no timezone/clock math is needed. If now or resets_at is missing,
+# or the gap is beyond that window's own horizon (a per-window cap: ~6h for 5h, ~8d for
+# 7d), the countdown is omitted and the plain "5h NN%" stays. Never fabricated.
+now="${CCT_NOW:-$(date +%s 2>/dev/null)}"
+case "$now" in ""|*[!0-9]*) now="" ;; esac
+seg="$(awk -v now="$now" '
+  # Return the text INSIDE key '"'"'s object, via a running brace-depth count from the key.
+  # This assumes the REAL statusline schema, whose window objects hold only numbers (no
+  # braces inside string values). A literal { or } inside a string value would desync the
+  # count; that only ever makes this COSMETIC segment omit or truncate a field (it can
+  # still emit nothing but digits + fixed literals, never injected text), and the
+  # AUTHORITATIVE parse is index.js'"'"'s real JSON.parse. Do NOT rely on this brace-walk for
+  # correctness on adversarial JSON; it is a cheap display heuristic, fail-soft by design.
   function objspan(key,   p, i, n, depth, start, c) {
     p = index(J, "\"" key "\"")
     if (p == 0) return ""
@@ -127,6 +141,42 @@ seg="$(awk '
     return t
   }
   function rnd(v) { if (v == "") return ""; return int(v + 0.5) }
+  # resets_at (a Unix epoch integer) belonging to key directly. Same objspan + nested-
+  # object strip as up(), but reads the integer "resets_at". Absent/null -> "" (no match),
+  # which makes the countdown omit cleanly.
+  function resetsat(key,   t) {
+    t = objspan(key)
+    if (t == "") return ""
+    gsub(/\{[^{}]*\}/, "", t)
+    if (match(t, /"resets_at"[ \t]*:[ \t]*[0-9]+/) == 0) return ""
+    t = substr(t, RSTART, RLENGTH)
+    sub(/.*:[ \t]*/, "", t)
+    return t
+  }
+  # Compact "~time-left" from an absolute reset epoch. Two units max; the leading unit is
+  # bare and the trailing unit shows ONLY when non-zero, so exact boundaries read "~5d" /
+  # "~2h" (never "~5d0h"). Tiers: days+hours at >= 1d, hours+minutes at >= 1h, bare
+  # minutes under 1h, "~<1m" under a minute, "~now" at or past reset. Omits (returns "")
+  # when: now/resets_at missing; resets_at is not a plausible epoch (< 1e9, e.g. a "1e12"
+  # value whose "[0-9]+" match grabbed only the leading "1" - guard against fabricating a
+  # bogus "~now"); or the gap exceeds maxsec, THIS window'"'"'s own horizon (~6h for the 5h
+  # window, ~8d for 7d), so a corrupt or foreign timestamp can never render "~6d" on a
+  # five-hour field. Never fabricates.
+  function countdown(rsat, maxsec,   sec, d, h, m) {
+    if (rsat == "" || now == "") return ""
+    if (rsat + 0 < 1000000000) return ""   # not a plausible Unix epoch (misparse) -> omit
+    sec = rsat - now
+    if (sec > maxsec) return ""            # beyond this window'"'"'s horizon -> corrupt/foreign, omit
+    if (sec <= 0) return "~now"
+    if (sec < 60) return "~<1m"
+    if (sec < 3600) return "~" int(sec/60) "m"
+    if (sec < 86400) {
+      h = int(sec/3600); m = int((sec%3600)/60)
+      return (m == 0) ? ("~" h "h") : ("~" h "h" m "m")
+    }
+    d = int(sec/86400); h = int((sec%86400)/3600)
+    return (h == 0) ? ("~" d "d") : ("~" d "d" h "h")
+  }
   # Slurp ALL input lines into J and process ONCE in END, so a multi-line / pretty-
   # printed payload is handled as a single record (concatenated) instead of the action
   # running per line and garbling the segment. Claude Code emits single-line JSON, but
@@ -134,9 +184,13 @@ seg="$(awk '
   { J = J $0 }
   END {
     c = rnd(up("context_window")); h = rnd(up("five_hour")); d = rnd(up("seven_day"))
+    # Per-window horizon caps: a 5h reset is at most ~5h out (21600s = 6h, 1h skew slack),
+    # a 7d reset at most ~7d out (691200s = 8d slack). Beyond that the value is corrupt or
+    # a foreign timestamp, so it is omitted rather than shown as a nonsensical countdown.
+    hcd = countdown(resetsat("five_hour"), 21600); dcd = countdown(resetsat("seven_day"), 691200)
     s = (c == "") ? "ctx --" : ("ctx " c "%")
-    if (h != "") s = s " | 5h " h "%"
-    if (d != "") s = s " | 7d " d "%"
+    if (h != "") { s = s " | 5h " h "%"; if (hcd != "") s = s " " hcd }
+    if (d != "") { s = s " | 7d " d "%"; if (dcd != "") s = s " " dcd }
     printf "%s", s
   }
 ' "$tmp" 2>/dev/null)"

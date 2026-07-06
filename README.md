@@ -3,12 +3,12 @@
 [![npm](https://img.shields.io/npm/v/cc-context-telemetry)](https://www.npmjs.com/package/cc-context-telemetry)
 [![license](https://img.shields.io/npm/l/cc-context-telemetry)](./LICENSE)
 
-Show Claude Code's context % and Pro/Max rate-limit usage right next to your
-existing statusline bar.
+Show Claude Code's context % and Pro/Max rate-limit usage, plus how long until each
+limit resets, right next to your existing statusline bar.
 
     before:   main  $9.07  21:04
 
-    after:    ctx 48% | 5h 14% | 7d 50%   main  $9.07  21:04
+    after:    ctx 48% | 5h 14% ~3h20m | 7d 50% ~4d   main  $9.07  21:04
 
 The trailing part is whatever your own statusline prints - this works with ANY
 statusline command, not a specific one.
@@ -17,8 +17,9 @@ Claude Code hooks and plugins cannot see context fullness or rate limits. The ON
 place Claude Code exposes the authoritative `context_window` (used percentage, window
 size) and Pro/Max `rate_limits` is the `statusLine` command. This tiny, zero-dependency
 library bridges that gap: a statusLine wrapper that prepends a compact
-`ctx % | 5h % | 7d %` segment to your own bar and also writes that telemetry to a
-per-session file your hooks can read.
+`ctx % | 5h % | 7d %` segment (each rate-limit field carrying a `~time-left` countdown to
+its reset) to your own bar and also writes that telemetry to a per-session file your hooks
+can read.
 
 One job, three pieces:
 
@@ -26,7 +27,8 @@ One job, three pieces:
   every render. It is **pure shell, with NO Node on the per-render path**: it reads the
   payload once, extracts the session id, and atomically writes the RAW payload to
   `telemetry-raw-<session>.json`. Then it prints a compact `ctx % | 5h % | 7d %`
-  segment and, if `CCT_WRAP` is set to your original statusline command, **`exec`s that
+  segment (each rate-limit field carrying a `~time-left` countdown to its reset) and, if
+  `CCT_WRAP` is set to your original statusline command, **`exec`s that
   command** so its bar appends right after the segment on the same line and it BECOMES
   the statusLine process (see Process handling for why this matters); with no `CCT_WRAP`
   the segment is the whole bar, never blank. There is no per-render Node spawn at all (an
@@ -130,7 +132,10 @@ assuming a shape):
 {
   "session_id": "abc123",
   "context_window": { "used_percentage": 47.2, "context_window_size": 200000 },
-  "rate_limits": { "five_hour": { "used_percentage": 12 }, "seven_day": { "used_percentage": 30 } },
+  "rate_limits": {
+    "five_hour": { "used_percentage": 12, "resets_at": 1783359600 },
+    "seven_day": { "used_percentage": 30, "resets_at": 1783368000 }
+  },
   "model": { "id": "claude-opus-4-1" }
 }
 ```
@@ -139,6 +144,14 @@ assuming a shape):
 `sevenDayPct` are omitted, never reported as 0) for API-key / Bedrock / Vertex.
 `context_window.used_percentage` is `null` before the first API response and right
 after a compaction (so `contextPct` is `null` and `fresh` is `false`).
+
+Each `rate_limits` window also carries `resets_at` (a Unix epoch, seconds). The shell
+segment renders it as a compact `~time-left` countdown next to the percent: at most two
+units (`~6d23h`, `~2h54m`, `~44m`, `~<1m`), and `~now` at or past the reset. It is a pure
+duration (reset minus `date +%s`), so there is no clock or timezone handling, and it is
+omitted whenever `resets_at` is missing (older Claude Code, or non-OAuth plans) or
+implausible - never fabricated. (`readTelemetry` currently surfaces the percentages, not
+the reset epochs; the raw file always contains them.)
 
 ### Raw-file hygiene
 
@@ -159,7 +172,7 @@ but a long-lived machine sees a new session id (UUID) per `claude` run. So
   stdin, and `&` leaves a process running past the render (exactly as it would running
   directly). If you need a pipeline, put it in a small script and point `CCT_WRAP` at
   that script. When `CCT_WRAP` is unset, the entry prints its own minimal bar
-  (`ctx 47% | 5h 12% | 7d 30%`).
+  (`ctx 47% | 5h 12% ~3h | 7d 30% ~5d`).
 - `CCT_DIR` - telemetry directory (default `~/.claude/cc-context-telemetry/`). The
   shell entry mirrors this default; set it on the statusLine env AND for your hooks so
   both sides agree.

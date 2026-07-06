@@ -207,6 +207,136 @@ test('standalone bar: malformed/empty stdin -> "ctx --", exit 0', function () {
 });
 
 // ============================================================================
+// (3b) RESET COUNTDOWN: "~<time-left>" appended to 5h/7d from resets_at.
+// DETERMINISTIC via the CCT_NOW seam (pins "now"); resets_at is now + secondsLeft, so
+// every tier boundary is exercised without depending on the wall clock.
+// ============================================================================
+
+// Pinned epoch for all countdown tests (via CCT_NOW). Chosen realistic (~2023, well above
+// the 1e9 plausible-epoch floor) so "reset just passed" cases (now - gap) stay above the
+// floor and correctly render ~now, as they do with real ~1.78e9 epochs.
+const NOW = 1700000000;
+// Build a payload with a fixed ctx% and optional 5h/7d limits at now+secondsLeft.
+function limitsPayload(fiveLeft, sevenLeft) {
+  const rl = {};
+  if (fiveLeft !== undefined) rl.five_hour = { used_percentage: 44, resets_at: NOW + fiveLeft };
+  if (sevenLeft !== undefined) rl.seven_day = { used_percentage: 31, resets_at: NOW + sevenLeft };
+  return { session_id: 's-cd', context_window: { used_percentage: 51 }, rate_limits: rl };
+}
+function bar(fiveLeft, sevenLeft) {
+  const dir = tmpDir();
+  return runEntry(limitsPayload(fiveLeft, sevenLeft), { CCT_DIR: dir, CCT_NOW: String(NOW) }).stdout;
+}
+const DAY = 86400, HOUR = 3600, MIN = 60;
+
+test('countdown: days+hours tier, trailing hours shown when non-zero (~6d23h)', function () {
+  assert.strictEqual(bar(2 * HOUR + 54 * MIN, 6 * DAY + 23 * HOUR + 59 * MIN),
+    'ctx 51% | 5h 44% ~2h54m | 7d 31% ~6d23h');
+});
+test('countdown: days+hours mid-window (~4d8h)', function () {
+  assert.strictEqual(bar(undefined, 4 * DAY + 8 * HOUR).replace('ctx 51% | ', ''), '7d 31% ~4d8h');
+});
+test('countdown: exact day boundary drops the 0h (~5d, never ~5d0h)', function () {
+  assert.strictEqual(bar(undefined, 5 * DAY), 'ctx 51% | 7d 31% ~5d');
+});
+test('countdown: last day switches to hours+minutes (~10h, minutes dropped at 0)', function () {
+  assert.strictEqual(bar(undefined, 10 * HOUR), 'ctx 51% | 7d 31% ~10h');
+});
+test('countdown: hours+minutes tier, minutes zero-dropped (~2h, not ~2h0m)', function () {
+  assert.strictEqual(bar(2 * HOUR, undefined), 'ctx 51% | 5h 44% ~2h');
+});
+test('countdown: hours+minutes with minutes (~2h54m)', function () {
+  assert.strictEqual(bar(2 * HOUR + 54 * MIN, undefined), 'ctx 51% | 5h 44% ~2h54m');
+});
+test('countdown: bare minutes tier under 1h (~44m)', function () {
+  assert.strictEqual(bar(44 * MIN, undefined), 'ctx 51% | 5h 44% ~44m');
+});
+test('countdown: under a minute -> ~<1m', function () {
+  assert.strictEqual(bar(30, undefined), 'ctx 51% | 5h 44% ~<1m');
+});
+test('countdown: at reset (0s) -> ~now', function () {
+  assert.strictEqual(bar(0, undefined), 'ctx 51% | 5h 44% ~now');
+});
+test('countdown: past reset (negative gap) -> ~now, not a negative number', function () {
+  assert.strictEqual(bar(-5 * HOUR, undefined), 'ctx 51% | 5h 44% ~now');
+});
+test('countdown: implausible gap (>8d) is omitted, plain % stays', function () {
+  assert.strictEqual(bar(9 * DAY, undefined), 'ctx 51% | 5h 44%');
+});
+// Per-window horizon caps: the 5h field must never render a multi-day countdown from a
+// corrupt/foreign resets_at. 5h cap = 6h (21600s), 7d cap = 8d (691200s).
+test('countdown: 5h horizon cap - a >6h 5h gap is omitted (no "~6d" on a five-hour field)', function () {
+  assert.strictEqual(bar(6 * HOUR + 60, undefined), 'ctx 51% | 5h 44%');   // just over 6h -> omit
+  assert.strictEqual(bar(6 * DAY + 22 * HOUR, undefined), 'ctx 51% | 5h 44%'); // the devil's ~6d22h case
+});
+test('countdown: 5h horizon cap - a 5h gap right at the window (5h) still shows', function () {
+  assert.strictEqual(bar(5 * HOUR, undefined), 'ctx 51% | 5h 44% ~5h');
+});
+test('countdown: 7d horizon cap - exactly 8d shows, just over 8d omits', function () {
+  assert.strictEqual(bar(undefined, 691200), 'ctx 51% | 7d 31% ~8d');
+  assert.strictEqual(bar(undefined, 691201), 'ctx 51% | 7d 31%');
+});
+// Exact tier-crossing boundaries (the neighbors were tested; assert the crossings themselves).
+test('countdown: exact tier boundaries (60s->~1m, 3600s->~1h, 86400s->~1d, 7d->~7d)', function () {
+  assert.strictEqual(bar(60, undefined), 'ctx 51% | 5h 44% ~1m');
+  assert.strictEqual(bar(59, undefined), 'ctx 51% | 5h 44% ~<1m');
+  assert.strictEqual(bar(3600, undefined), 'ctx 51% | 5h 44% ~1h');
+  assert.strictEqual(bar(undefined, 86400), 'ctx 51% | 7d 31% ~1d');
+  assert.strictEqual(bar(undefined, 86399), 'ctx 51% | 7d 31% ~23h59m');
+  assert.strictEqual(bar(undefined, 7 * DAY), 'ctx 51% | 7d 31% ~7d');
+});
+// Fail-soft on malformed resets_at (the devil's misparse cases): never fabricate, omit.
+function rawBar(resetsAtLiteral) {
+  const dir = tmpDir();
+  const p = '{"session_id":"s-cd","context_window":{"used_percentage":51},"rate_limits":' +
+    '{"five_hour":{"used_percentage":44,"resets_at":' + resetsAtLiteral + '}}}';
+  return runEntry(p, { CCT_DIR: dir, CCT_NOW: String(NOW) }).stdout;
+}
+test('countdown: scientific-notation resets_at (1e12) is omitted, NOT fabricated as ~now', function () {
+  assert.strictEqual(rawBar('1e12'), 'ctx 51% | 5h 44%');
+});
+test('countdown: string-valued resets_at ("...") is omitted (digit match blocked by quote)', function () {
+  assert.strictEqual(rawBar('"' + (NOW + 2 * HOUR) + '"'), 'ctx 51% | 5h 44%');
+});
+test('countdown: negative resets_at is omitted (not misread as a positive)', function () {
+  assert.strictEqual(rawBar('-5'), 'ctx 51% | 5h 44%');
+});
+test('countdown: below-epoch-floor resets_at (small int) is omitted, never ~now', function () {
+  assert.strictEqual(rawBar('12345'), 'ctx 51% | 5h 44%');
+});
+test('countdown: resets_at ABSENT -> plain %, no countdown (never fabricated)', function () {
+  const dir = tmpDir();
+  const p = { session_id: 's-cd', context_window: { used_percentage: 51 },
+    rate_limits: { five_hour: { used_percentage: 44 }, seven_day: { used_percentage: 31 } } };
+  assert.strictEqual(runEntry(p, { CCT_DIR: dir, CCT_NOW: String(NOW) }).stdout,
+    'ctx 51% | 5h 44% | 7d 31%');
+});
+test('countdown: resets_at null -> plain % (no match, omitted)', function () {
+  const dir = tmpDir();
+  const p = { session_id: 's-cd', context_window: { used_percentage: 51 },
+    rate_limits: { five_hour: { used_percentage: 44, resets_at: null } } };
+  assert.strictEqual(runEntry(p, { CCT_DIR: dir, CCT_NOW: String(NOW) }).stdout, 'ctx 51% | 5h 44%');
+});
+test('countdown: non-numeric CCT_NOW disables countdowns, plain % stays', function () {
+  const dir = tmpDir();
+  assert.strictEqual(runEntry(limitsPayload(2 * HOUR, 3 * DAY), { CCT_DIR: dir, CCT_NOW: 'garbage' }).stdout,
+    'ctx 51% | 5h 44% | 7d 31%');
+});
+test('countdown: both 5h and 7d carry independent countdowns', function () {
+  assert.strictEqual(bar(44 * MIN, 3 * DAY + 5 * HOUR),
+    'ctx 51% | 5h 44% ~44m | 7d 31% ~3d5h');
+});
+test('countdown: object scoping - 5h resets_at must not leak into 7d', function () {
+  const dir = tmpDir();
+  // 7d has a pct but NO resets_at; 5h has one. 7d must stay plain, not borrow 5h.
+  const p = { session_id: 's-cd', context_window: { used_percentage: 51 },
+    rate_limits: { five_hour: { used_percentage: 44, resets_at: NOW + 2 * HOUR },
+      seven_day: { used_percentage: 31 } } };
+  assert.strictEqual(runEntry(p, { CCT_DIR: dir, CCT_NOW: String(NOW) }).stdout,
+    'ctx 51% | 5h 44% ~2h | 7d 31%');
+});
+
+// ============================================================================
 // (4) WRAP-MODE exec passthrough
 // ============================================================================
 
