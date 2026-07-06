@@ -6,12 +6,14 @@
 Show Claude Code's context % and Pro/Max rate-limit usage, plus how long until each
 limit resets, right next to your existing statusline bar.
 
-    before:   main  $9.07  21:04
+    before:   ~/code/myapp  main
 
-    after:    ctx 48% | 5h 14% ~3h20m | 7d 50% ~4d   main  $9.07  21:04
+    after:    ctx 48% | 5h 14% ~3h20m | 7d 50% ~4d   ~/code/myapp  main
 
-The trailing part is whatever your own statusline prints - this works with ANY
-statusline command, not a specific one.
+The trailing part (`~/code/myapp  main` here) is whatever your own statusline already
+prints - cct wraps ANY statusline command, not a specific one. A busier bar wraps the
+same way: e.g. the adtention plugin's `main  $9.07  21:04` becomes
+`ctx 48% | 5h 14% ~3h20m | 7d 50% ~4d   main  $9.07  21:04`.
 
 Claude Code hooks and plugins cannot see context fullness or rate limits. The ONLY
 place Claude Code exposes the authoritative `context_window` (used percentage, window
