@@ -105,16 +105,18 @@ if (t && t.fresh && t.contextPct >= 85) { /* near the wall: act */ }
 
 ```js
 {
-  sessionId,      // string
-  contextPct,     // number or null (context window used %)
-  usedPercentage, // number or null (alias of contextPct)
-  windowSize,     // number or null (context_window_size)
-  fiveHourPct,    // number, OMITTED when Claude Code did not report it
-  sevenDayPct,    // number, OMITTED when Claude Code did not report it
-  model,          // string or null (model id)
-  ts,             // ISO timestamp string or null
-  source,         // "statusline"
-  fresh           // true when contextPct is a finite number AND ts is within the TTL
+  sessionId,        // string
+  contextPct,       // number or null (context window used %)
+  usedPercentage,   // number or null (alias of contextPct)
+  windowSize,       // number or null (context_window_size)
+  fiveHourPct,      // number, OMITTED when Claude Code did not report it
+  sevenDayPct,      // number, OMITTED when Claude Code did not report it
+  fiveHourResetsAt, // number (Unix epoch seconds), OMITTED when absent
+  sevenDayResetsAt, // number (Unix epoch seconds), OMITTED when absent
+  model,            // string or null (model id)
+  ts,               // ISO timestamp string or null
+  source,           // "statusline"
+  fresh             // true when contextPct is a finite number AND ts is within the TTL
 }
 ```
 
@@ -122,6 +124,15 @@ if (t && t.fresh && t.contextPct >= 85) { /* near the wall: act */ }
 `context_window.used_percentage` (a percentage, 0..100 in practice). The library does
 NOT range-clamp them; it only verifies they are numbers, so treat them as advisory and
 do not assume a strict `0..100` bound. `fresh` already rejects non-finite values.
+
+`fiveHourResetsAt` / `sevenDayResetsAt` are the Unix epoch (seconds) when each rate-limit
+window next resets. They are omitted (like the percentages) when the payload has no
+`rate_limits` or no `resets_at`, and also when the value is not a plausible epoch - the
+reader rejects non-epoch or absurd values (mirroring the statusline renderer) so a corrupt
+file cannot hand you a bogus reset time. Compute time-left yourself, e.g.
+`fiveHourResetsAt - Date.now() / 1000`. A reset time can still be in the PAST when the
+reading is stale (Claude Code refreshes `rate_limits` only on an API call), so gate on
+`fresh` and treat an already-passed reset as stale, not as "resetting now".
 
 `fresh` rejects both stale and far-future timestamps (it checks the absolute age
 against the TTL). When `fresh` is false, treat it as "no signal" and stay
@@ -167,8 +178,8 @@ segment renders it as a compact `~time-left` countdown next to the percent: at m
 units (`~6d23h`, `~2h54m`, `~44m`, `~<1m`), and `~now` at or past the reset. It is a pure
 duration (reset minus `date +%s`), so there is no clock or timezone handling, and it is
 omitted whenever `resets_at` is missing (older Claude Code, or non-OAuth plans) or
-implausible - never fabricated. (`readTelemetry` currently surfaces the percentages, not
-the reset epochs; the raw file always contains them.)
+implausible - never fabricated. (`readTelemetry` surfaces these reset epochs too, as
+`fiveHourResetsAt` / `sevenDayResetsAt`; see the Consumer API section.)
 
 ### Raw-file hygiene
 

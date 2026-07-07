@@ -81,7 +81,8 @@ test('atomic write leaves NO leftover .tmp files in the dir', function () {
 test('round-trip FULL Pro/Max payload (rate_limits + 200k window)', function () {
   const dir = tmpDir(); process.env.CCT_DIR = dir;
   runEntry({ session_id: 's-pro', context_window: { used_percentage: 47.2, context_window_size: 200000 },
-    rate_limits: { five_hour: { used_percentage: 12 }, seven_day: { used_percentage: 30 } },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: 1783359600 },
+      seven_day: { used_percentage: 30, resets_at: 1783368000 } },
     model: { id: 'claude-opus-4-1' } }, { CCT_DIR: dir });
   const t = api.readTelemetry('s-pro');
   assert.ok(t);
@@ -90,10 +91,76 @@ test('round-trip FULL Pro/Max payload (rate_limits + 200k window)', function () 
   assert.strictEqual(t.windowSize, 200000);
   assert.strictEqual(t.fiveHourPct, 12);
   assert.strictEqual(t.sevenDayPct, 30);
+  assert.strictEqual(t.fiveHourResetsAt, 1783359600, 'reset epoch surfaced for hooks');
+  assert.strictEqual(t.sevenDayResetsAt, 1783368000);
   assert.strictEqual(t.model, 'claude-opus-4-1');
   assert.strictEqual(t.source, 'statusline');
   assert.strictEqual(t.fresh, true, 'a just-written raw file is fresh');
   delete process.env.CCT_DIR;
+});
+
+// ============================================================================
+// (2b) RESET EPOCHS in the consumer API: readTelemetry/parsePayload surface
+// fiveHourResetsAt / sevenDayResetsAt (Unix epoch), verbatim passthrough, omitted
+// when absent - exactly like the percentages. For hooks that gate on reset timing.
+// ============================================================================
+
+test('parsePayload surfaces fiveHourResetsAt / sevenDayResetsAt verbatim', function () {
+  const p = api.parsePayload({ session_id: 's', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: 1783359600 },
+      seven_day: { used_percentage: 30, resets_at: 1783368000 } } }, 's');
+  assert.strictEqual(p.fiveHourResetsAt, 1783359600);
+  assert.strictEqual(p.sevenDayResetsAt, 1783368000);
+});
+
+test('reset epochs OMITTED (undefined) when resets_at absent, like the percentages', function () {
+  const p = api.parsePayload({ session_id: 's', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 12 }, seven_day: { used_percentage: 30 } } }, 's');
+  assert.strictEqual(p.fiveHourResetsAt, undefined);
+  assert.strictEqual(p.sevenDayResetsAt, undefined);
+  assert.strictEqual('fiveHourResetsAt' in p, true, 'key present with undefined value, like fiveHourPct');
+});
+
+test('reset epochs OMITTED when NO rate_limits at all (API-key / Bedrock / Vertex)', function () {
+  const p = api.parsePayload({ session_id: 's', context_window: { used_percentage: 60 } }, 's');
+  assert.strictEqual(p.fiveHourResetsAt, undefined);
+  assert.strictEqual(p.sevenDayResetsAt, undefined);
+});
+
+test('reset epoch surfaced per-window independently (5h has it, 7d does not)', function () {
+  const p = api.parsePayload({ session_id: 's', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: 1783359600 },
+      seven_day: { used_percentage: 30 } } }, 's');
+  assert.strictEqual(p.fiveHourResetsAt, 1783359600);
+  assert.strictEqual(p.sevenDayResetsAt, undefined);
+});
+
+test('non-numeric resets_at (string / null) -> undefined, never a bogus value', function () {
+  const pStr = api.parsePayload({ session_id: 's', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: '1783359600' } } }, 's');
+  assert.strictEqual(pStr.fiveHourResetsAt, undefined, 'string resets_at rejected (typeof check)');
+  const pNull = api.parsePayload({ session_id: 's', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: null } } }, 's');
+  assert.strictEqual(pNull.fiveHourResetsAt, undefined, 'null resets_at rejected');
+});
+
+// Plausible-epoch guard: the Node reader must agree with the shell renderer, which
+// floors resets_at at a real Unix epoch. A corrupt/hostile raw file must never hand a hook
+// a bogus reset time (negative, 0, sub-epoch, absurd far-future) or NaN/Infinity.
+test('reset epoch: implausible values rejected, matching the shell renderer', function () {
+  const mk = function (r) {
+    return api.parsePayload({ session_id: 's', context_window: { used_percentage: 5 },
+      rate_limits: { five_hour: { used_percentage: 12, resets_at: r } } }, 's').fiveHourResetsAt;
+  };
+  assert.strictEqual(mk(-5), undefined, 'negative');
+  assert.strictEqual(mk(0), undefined, 'zero');
+  assert.strictEqual(mk(12345), undefined, 'below the 1e9 epoch floor');
+  assert.strictEqual(mk(999999999), undefined, 'just below 1e9');
+  assert.strictEqual(mk(1e15), undefined, 'absurd far-future (the devil-repro 1e15)');
+  assert.strictEqual(mk(NaN), undefined, 'NaN fails the range compare');
+  assert.strictEqual(mk(Infinity), undefined, 'Infinity fails the range compare');
+  assert.strictEqual(mk(1000000000), 1000000000, 'exactly 1e9 accepted (boundary)');
+  assert.strictEqual(mk(1783359600), 1783359600, 'a real epoch accepted');
 });
 
 test('round-trip 1M window', function () {

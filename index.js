@@ -214,6 +214,21 @@ function parsePayload(d, sessionId) {
     ? rl.five_hour.used_percentage : undefined;
   const sevenD = (rl && rl.seven_day && typeof rl.seven_day.used_percentage === 'number')
     ? rl.seven_day.used_percentage : undefined;
+  // resets_at: the Unix epoch (seconds) when each window next resets, surfaced for hooks.
+  // Accepted ONLY when it is a PLAUSIBLE seconds-epoch: >= 1e9 (year 2001) and < 1e11
+  // (year ~5138). This mirrors the shell renderer's own epoch floor (bin/cct-statusline),
+  // so the two consumers of this one field agree, and it stops a corrupt or hostile raw
+  // file from handing a hook a bogus reset time (negative, 0, small ints, absurd
+  // far-future) or NaN/Infinity (which fail the range compare). Omitted (undefined) when
+  // the window/field is absent or implausible. Not clock-relative: a consumer computes
+  // time-left as resets_at - Date.now() / 1000 and treats a past or implausible value as
+  // stale (Claude Code refreshes rate_limits only on an API call).
+  const fiveHReset = (rl && rl.five_hour && typeof rl.five_hour.resets_at === 'number'
+    && rl.five_hour.resets_at >= 1e9 && rl.five_hour.resets_at < 1e11)
+    ? rl.five_hour.resets_at : undefined;
+  const sevenDReset = (rl && rl.seven_day && typeof rl.seven_day.resets_at === 'number'
+    && rl.seven_day.resets_at >= 1e9 && rl.seven_day.resets_at < 1e11)
+    ? rl.seven_day.resets_at : undefined;
   const model = (d.model && typeof d.model.id === 'string') ? d.model.id : null;
   const sid = (typeof d.session_id === 'string' && d.session_id)
     ? d.session_id : (sessionId || 'default');
@@ -224,6 +239,8 @@ function parsePayload(d, sessionId) {
     windowSize: windowSize,
     fiveHourPct: fiveH,
     sevenDayPct: sevenD,
+    fiveHourResetsAt: fiveHReset,
+    sevenDayResetsAt: sevenDReset,
     model: model,
     source: 'statusline',
   };
@@ -235,7 +252,8 @@ function parsePayload(d, sessionId) {
 //
 //   {
 //     sessionId, contextPct, usedPercentage, windowSize,
-//     fiveHourPct?, sevenDayPct?, model, ts, source, fresh
+//     fiveHourPct?, sevenDayPct?, fiveHourResetsAt?, sevenDayResetsAt?,
+//     model, ts, source, fresh
 //   }
 //
 // Freshness comes from the raw file's modification time (the pure-shell entry writes
