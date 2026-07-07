@@ -22,23 +22,33 @@ Install:
 npm i -g cc-context-telemetry
 ```
 
-Wire it as your `statusLine` in `~/.claude/settings.json`, with `CCT_WRAP` set to your
-current statusline command so the segment shows in front of your bar:
+Set it as your `statusLine` in `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": { "type": "command", "command": "cc-context-telemetry-statusline" }
+}
+```
+
+That is it - your statusline is now `ctx % | 5h % | 7d %` with reset countdowns. (Settings
+changes take effect in a new session. Prefer a stable absolute path? Point `command` at an
+installed or checked-out `bin/cct-statusline` instead of the global shim.)
+
+**Already run a statusline you want to keep?** Add `CCT_WRAP`, set to your existing
+statusline command; the segment then prepends to it on the same line:
 
 ```json
 {
   "statusLine": {
     "type": "command",
     "command": "cc-context-telemetry-statusline",
-    "env": { "CCT_WRAP": "<your current statusLine command>" }
+    "env": { "CCT_WRAP": "<your existing statusline command>" }
   }
 }
 ```
 
-Done - your bar now starts with the `ctx % | 5h % | 7d %` segment. With no `CCT_WRAP` the
-segment is your whole bar. (Prefer a stable absolute path? Point `command` at an installed
-or checked-out `bin/cct-statusline` instead of the global shim. On a Claude Code that does
-not accept an `env` block on `statusLine`, export `CCT_WRAP` in your shell profile instead.)
+(If your Claude Code version does not accept an `env` block, export `CCT_WRAP` in your
+shell profile instead.)
 
 > That is all you need for the bar. The rest is optional: how it works, then the API for
 > hooks and plugins that read this telemetry.
