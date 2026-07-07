@@ -22,6 +22,10 @@ Install:
 npm i -g cc-context-telemetry
 ```
 
+(No Node or npm on the machine, e.g. a native Claude Code install? Skip the npm step: `git
+clone` the repo and use the absolute path to its `bin/cct-statusline` as the `command`
+below. The statusline path is pure POSIX shell, so it needs neither Node nor npm.)
+
 Set it as your `statusLine` in `~/.claude/settings.json`:
 
 ```json
@@ -81,8 +85,9 @@ One job, three pieces:
 - `bin/telemetry.js` - an on-demand CLI reader over `readTelemetry`, for the manual
   live check. It is NOT in the per-render path; it runs only when you invoke it.
 
-Zero third-party dependencies. Node >= 18. POSIX shell (Linux/macOS). Never throws, never
-calls `claude`.
+Zero third-party dependencies. The statusline path needs only a POSIX shell (Linux/macOS);
+Node >= 18 is required only for the hooks API (`readTelemetry`) and the `bin/telemetry.js`
+reader. Never throws, never calls `claude`.
 
 ## Consumer API (hooks)
 
