@@ -54,6 +54,11 @@ statusline command; the segment then prepends to it on the same line:
 (If your Claude Code version does not accept an `env` block, export `CCT_WRAP` in your
 shell profile instead.)
 
+Either direction chains, because cct `exec`s through: cct can wrap your bar (above), or if
+another statusline tool already owns your `statusLine`, point THAT tool at cct instead of
+the reverse - put cct's command in the host's own wrap channel so it keeps managing the
+statusLine. See [`examples/host-owned-statusline.md`](examples/host-owned-statusline.md).
+
 ## Customizing the bar
 
 `CCT_SEGMENTS` picks which segments show and in what order - a comma (or space) separated
