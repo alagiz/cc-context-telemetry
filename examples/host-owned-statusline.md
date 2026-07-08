@@ -48,5 +48,6 @@ use; the steps are the same shape.)
 
 If your host already shows a context/usage readout, cct's `ctx %` may duplicate it. In
 that case cct's distinct value is the separate 5h and 7d rate-limit windows; decide
-whether you want the full `ctx % | 5h % | 7d %` segment, or to rely on the host for
+whether you want the full `ctx % | 5h % | 7d % | model` segment (drop any part with
+`CCT_SEGMENTS`, e.g. `CCT_SEGMENTS="5h,7d"`), or to rely on the host for
 context and use cct only for the telemetry file your hooks read.

@@ -3,12 +3,12 @@
 [![npm](https://img.shields.io/npm/v/cc-context-telemetry)](https://www.npmjs.com/package/cc-context-telemetry)
 [![license](https://img.shields.io/npm/l/cc-context-telemetry)](./LICENSE)
 
-Show Claude Code's context % and Pro/Max rate-limit usage, plus how long until each
-limit resets, right next to your existing statusline bar.
+Show Claude Code's context % and Pro/Max rate-limit usage (with how long until each limit
+resets) and the current model, right next to your existing statusline bar.
 
     before:   ~/code/myapp  main
 
-    after:    ctx 48% | 5h 14% ~3h20m | 7d 50% ~4d   ~/code/myapp  main
+    after:    ctx 48% | 5h 14% ~3h20m | 7d 50% ~4d | opus-4.8   ~/code/myapp  main
 
 The trailing part is whatever your own statusline already prints - cct wraps ANY
 statusline command, not a specific one (a busier bar, like the adtention plugin's
@@ -34,7 +34,7 @@ Set it as your `statusLine` in `~/.claude/settings.json`:
 }
 ```
 
-That is it - your statusline is now `ctx % | 5h % | 7d %` with reset countdowns. (Settings
+That is it - your statusline is now `ctx % | 5h % | 7d % | model` with reset countdowns. (Settings
 changes take effect in a new session. Prefer a stable absolute path? Point `command` at an
 installed or checked-out `bin/cct-statusline` instead of the global shim.)
 
@@ -85,9 +85,10 @@ Set it in the same `statusLine.env` block as `command` / `CCT_WRAP`.
 Claude Code hooks and plugins cannot see context fullness or rate limits. The ONLY place
 Claude Code exposes the authoritative `context_window` (used percentage, window size) and
 Pro/Max `rate_limits` is the `statusLine` command. This tiny, zero-dependency library
-bridges that gap: a statusLine wrapper that prepends the `ctx % | 5h % | 7d %` segment
-(each rate-limit field carrying a `~time-left` countdown to its reset) to your own bar and
-also writes that telemetry to a per-session file your hooks can read.
+bridges that gap: a statusLine wrapper that prepends a compact segment - context %, the
+5h/7d rate limits each with a `~time-left` reset countdown, and the current model (default
+`ctx,5h,7d,model`, all configurable) - to your own bar, and also writes that telemetry to a
+per-session file your hooks can read.
 
 `ctx` is per session. The 5h/7d rate limits are account-wide but Claude Code only refreshes
 them on an API call, so any single session's view is often stale. The bar therefore shows
@@ -100,8 +101,8 @@ One job, three pieces:
 - `bin/cct-statusline` - the POSIX shell entry Claude Code calls as its statusLine,
   every render. It is **pure shell, with NO Node on the per-render path**: it reads the
   payload once, extracts the session id, and atomically writes the RAW payload to
-  `telemetry-raw-<session>.json`. Then it prints the `ctx % | 5h % | 7d %` segment (each
-  rate-limit field carrying a `~time-left` countdown to its reset) and, if `CCT_WRAP` is
+  `telemetry-raw-<session>.json`. Then it prints the `ctx % | 5h % | 7d % | model` segment
+  (each rate-limit field carrying a `~time-left` countdown to its reset) and, if `CCT_WRAP` is
   set to your original statusline command, **`exec`s that command** so its bar appends
   right after the segment on the same line and it BECOMES the statusLine process (see
   "Safe to run every render" for why this matters); with no `CCT_WRAP` the segment is the
@@ -229,7 +230,7 @@ but a long-lived machine sees a new session id (UUID) per `claude` run. So
   stdin, and `&` leaves a process running past the render (exactly as it would running
   directly). If you need a pipeline, put it in a small script and point `CCT_WRAP` at
   that script. When `CCT_WRAP` is unset, the entry prints its own minimal bar
-  (`ctx 47% | 5h 12% ~3h | 7d 30% ~5d`).
+  (`ctx 47% | 5h 12% ~3h | 7d 30% ~5d | opus-4.8`).
 - `CCT_SEGMENTS` - which bar segments to show and in what order (default `ctx,5h,7d,model`);
   see Customizing the bar.
 - `CCT_DIR` - telemetry directory (default `~/.claude/cc-context-telemetry/`). The
