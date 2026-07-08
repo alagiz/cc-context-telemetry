@@ -41,7 +41,16 @@ echo 'cc-context-telemetry-statusline' > ~/.claude/adtention/wrapped_cmd
 
 adtention runs it each render with the statusLine JSON on stdin and shows its output as
 the prefix, ahead of its own segment, persisting across sessions while adtention stays
-the registered statusLine. (Substitute the equivalent mechanism for whatever host you
+the registered statusLine.
+
+To customize the segment (see "Customizing the bar" in the README), set `CCT_SEGMENTS`
+inline in the same wrapped-command file. Because the host re-runs this command every
+render, it takes effect on the NEXT render with no session restart (unlike setting the
+variable in `statusLine.env` or a shell profile, which needs a fresh session):
+
+```sh
+echo 'CCT_SEGMENTS="ctx,7d,5h" cc-context-telemetry-statusline' > ~/.claude/adtention/wrapped_cmd
+``` (Substitute the equivalent mechanism for whatever host you
 use; the steps are the same shape.)
 
 ## Note on duplicated readouts

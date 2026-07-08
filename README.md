@@ -90,6 +90,13 @@ Set it in your `statusLine` env block in `~/.claude/settings.json`, next to `com
 
 (Or export `CCT_SEGMENTS` in your shell profile instead.)
 
+**Both set an environment variable Claude Code reads at launch, so the change takes effect
+only in a NEW session** - existing sessions keep their current bar until you start a fresh
+one. If another tool owns your `statusLine` (a host-owned setup, e.g. a plugin that runs cct
+through its own wrap channel), setting the variable in that tool's per-render command takes
+effect on the next render with no restart; see
+[`examples/host-owned-statusline.md`](examples/host-owned-statusline.md).
+
 ## Uninstall
 
 Remove the `statusLine` block from `~/.claude/settings.json` (or set `command` back to your
