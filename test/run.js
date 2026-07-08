@@ -163,6 +163,114 @@ test('reset epoch: implausible values rejected, matching the shell renderer', fu
   assert.strictEqual(mk(1783359600), 1783359600, 'a real epoch accepted');
 });
 
+// ============================================================================
+// (3c) ACCOUNT-WIDE rate limits: the statusline segment shows the FRESHEST 5h/7d
+// reading across ALL sessions' raw files (max plausible resets_at, tie-break max
+// usage), so open sessions do not diverge on the account-wide limits. ctx stays
+// per-session. Deterministic via CCT_NOW + pre-written raw files.
+// ============================================================================
+
+const AW_NOW = 1700000000;
+function writeRaw(dir, sid, obj) {
+  fs.writeFileSync(path.join(dir, 'telemetry-raw-' + sid + '.json'), JSON.stringify(obj));
+}
+// Render `current` (this session's payload) in a dir seeded with `others` (other sessions).
+function awBar(current, others) {
+  const dir = tmpDir();
+  (others || []).forEach(function (s) { writeRaw(dir, s.sid, s.obj); });
+  return runEntry(current, { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+}
+
+test('account-wide: 5h shows the FRESHEST reading across sessions, not this/stale one', function () {
+  const out = awBar(
+    { session_id: 'C', context_window: { used_percentage: 33 },
+      rate_limits: { five_hour: { used_percentage: 55, resets_at: AW_NOW - 3600 } } },
+    [ { sid: 'A', obj: { session_id: 'A', context_window: { used_percentage: 10 },
+          rate_limits: { five_hour: { used_percentage: 90, resets_at: AW_NOW - 7200 } } } },
+      { sid: 'B', obj: { session_id: 'B', context_window: { used_percentage: 20 },
+          rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW + 10800 } } } } ]);
+  assert.strictEqual(out, 'ctx 33% | 5h 12% ~3h', 'ctx from THIS session; 5h from freshest (B)');
+});
+
+test('account-wide: tie on resets_at -> higher usage wins (latest within the window)', function () {
+  const R = AW_NOW + 7200;
+  const out = awBar(
+    { session_id: 'C', context_window: { used_percentage: 33 },
+      rate_limits: { five_hour: { used_percentage: 40, resets_at: R } } },
+    [ { sid: 'B', obj: { session_id: 'B', context_window: { used_percentage: 20 },
+          rate_limits: { five_hour: { used_percentage: 71, resets_at: R } } } } ]);
+  assert.strictEqual(out, 'ctx 33% | 5h 71% ~2h', 'same reset -> max usage (71) wins');
+});
+
+test('account-wide: a corrupt far-future resets_at does not win selection', function () {
+  const out = awBar(
+    { session_id: 'C', context_window: { used_percentage: 33 },
+      rate_limits: { five_hour: { used_percentage: 20, resets_at: AW_NOW + 3600 } } },
+    [ { sid: 'X', obj: { session_id: 'X', context_window: { used_percentage: 5 },
+          rate_limits: { five_hour: { used_percentage: 99, resets_at: AW_NOW + 5 * 86400 } } } } ]);
+  assert.strictEqual(out, 'ctx 33% | 5h 20% ~1h', 'far-future (5d for a 5h window) rejected; legit 1h wins');
+});
+
+test('account-wide: all sessions stale -> least-stale usage, countdown honestly ~now', function () {
+  const out = awBar(
+    { session_id: 'C', context_window: { used_percentage: 33 },
+      rate_limits: { five_hour: { used_percentage: 60, resets_at: AW_NOW - 7200 } } },
+    [ { sid: 'A', obj: { session_id: 'A', context_window: { used_percentage: 10 },
+          rate_limits: { five_hour: { used_percentage: 80, resets_at: AW_NOW - 3600 } } } } ]);
+  assert.strictEqual(out, 'ctx 33% | 5h 80% ~now', 'newest reset among stale wins; ~now untouched');
+});
+
+test('account-wide: ctx is always THIS session, never another', function () {
+  const out = awBar(
+    { session_id: 'C', context_window: { used_percentage: 7 } },
+    [ { sid: 'B', obj: { session_id: 'B', context_window: { used_percentage: 88 },
+          rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW + 3600 } } } } ]);
+  assert.strictEqual(out, 'ctx 7% | 5h 12% ~1h', 'ctx 7 from THIS session, not 88 from B');
+});
+
+test('account-wide: 5h and 7d each pick their own freshest session independently', function () {
+  const out = awBar(
+    { session_id: 'C', context_window: { used_percentage: 33 },
+      rate_limits: { five_hour: { used_percentage: 50, resets_at: AW_NOW - 100 },
+        seven_day: { used_percentage: 40, resets_at: AW_NOW + 3 * 86400 } } },
+    [ { sid: 'B', obj: { session_id: 'B', context_window: { used_percentage: 20 },
+          rate_limits: { five_hour: { used_percentage: 15, resets_at: AW_NOW + 7200 } } } } ]);
+  assert.strictEqual(out, 'ctx 33% | 5h 15% ~2h | 7d 40% ~3d', '5h freshest from B, 7d from this session');
+});
+
+// Regression tests for the review-gate findings on the account-wide pool.
+
+test('account-wide: an unreadable or non-regular pool file is SKIPPED, segment stays intact', function () {
+  const dir = tmpDir();
+  fs.mkdirSync(path.join(dir, 'telemetry-raw-adir.json'));   // a dir matching the glob (non-regular)
+  const bad = path.join(dir, 'telemetry-raw-bad.json');
+  fs.writeFileSync(bad, '{}'); fs.chmodSync(bad, 0);          // an unreadable file
+  const out = runEntry({ session_id: 'C', context_window: { used_percentage: 33 },
+    rate_limits: { five_hour: { used_percentage: 20, resets_at: AW_NOW + 3600 } } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  fs.chmodSync(bad, 0o644);  // restore so the temp entry is not left unreadable
+  assert.strictEqual(out, 'ctx 33% | 5h 20% ~1h', 'bad pool entries skipped, not fatal');
+});
+
+test('account-wide: the file pool is NOT leaked to CCT_WRAP as positional args', function () {
+  const dir = tmpDir();
+  writeRaw(dir, 'B', { session_id: 'B', context_window: { used_percentage: 20 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW + 3600 } } });
+  const r = runEntry({ session_id: 'C', context_window: { used_percentage: 33 } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW), CCT_WRAP: 'printf "[argc=%s]" "$#"' });
+  assert.strictEqual(r.stdout, 'ctx 33% | 5h 12% ~1h [argc=0]', 'CCT_WRAP sees no argv from the glob');
+});
+
+test('account-wide: with now unavailable, a corrupt far-future reading cannot win (falls back)', function () {
+  const dir = tmpDir();
+  writeRaw(dir, 'X', { session_id: 'X', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 99, resets_at: 50000000000 } } });  // corrupt, in [1e9,1e11)
+  const out = runEntry({ session_id: 'C', context_window: { used_percentage: 33 },
+    rate_limits: { five_hour: { used_percentage: 20, resets_at: AW_NOW + 3600 } } },
+    { CCT_DIR: dir, CCT_NOW: 'garbage' }).stdout;  // non-numeric -> now=""
+  assert.strictEqual(out, 'ctx 33% | 5h 20%', 'now unset -> this session (20%), not the corrupt 99%, no countdown');
+});
+
 test('round-trip 1M window', function () {
   const dir = tmpDir(); process.env.CCT_DIR = dir;
   runEntry({ session_id: 's-1m', context_window: { used_percentage: 10, context_window_size: 1000000 },

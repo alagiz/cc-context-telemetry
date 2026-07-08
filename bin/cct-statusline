@@ -77,43 +77,53 @@ if cp "$tmp" "$raw_tmp" 2>/dev/null; then
   mv -f "$raw_tmp" "$raw_final" 2>/dev/null || rm -f "$raw_tmp" 2>/dev/null || true
 fi
 
-# Build the telemetry SEGMENT (ctx / 5h / 7d) from the payload in cheap pure shell.
-# It is shown in BOTH modes: PREPENDED to the wrapped statusline's bar in WRAP mode (so
-# you see "ctx 66% | 5h 12% | 7d 30% <your adtention bar>"), or rendered as the whole
-# bar in STANDALONE mode. No emoji (project rule). Never blank.
+# Build the telemetry SEGMENT: "ctx X% | 5h Y% ~cd | 7d Z% ~cd" in cheap pure shell.
+# Shown PREPENDED in WRAP mode and as the whole bar in STANDALONE. No emoji (project rule).
+# Never blank. Cosmetic and fail-soft; the AUTHORITATIVE parse is index.js (real JSON.parse).
 #
-# Extract context_window.used_percentage and rate_limits 5h/7d used_percentage. The
-# payload nests used_percentage under several keys, so we scope each match to its
-# object: context % is the used_percentage INSIDE the context_window object; 5h/7d are
-# INSIDE rate_limits.five_hour / seven_day. We match the smallest object span per key.
-# A number may be int or float, possibly null. Bounded sed over the small one-line
-# payload; on no match the field is "--" (never fabricated, never blanked).
-# Build the segment in ONE awk pass (one cheap process, not Node). For each object
-# key, find the key name, then the FIRST "used_percentage": NUMBER that follows it.
-# This is robust to nested objects BEFORE used_percentage (e.g. context_window's
-# "current_usage":{...} which has no used_percentage of its own, so the first
-# used_percentage after "context_window" is the real one). five_hour / seven_day are
-# flat. A null or absent value yields no match -> that field is omitted/"--". index()
-# of "\"key\"" (with quotes) does not match "context_window_size". DISPLAY-ONLY and
-# fail-soft: never fabricates, never blanks. The AUTHORITATIVE path remains index.js
-# (real JSON.parse via readTelemetry); this segment is cosmetic.
+# ctx (context %) is PER SESSION: it comes only from THIS render's payload ($tmp).
 #
-# TIME-LEFT: for 5h/7d we also read "resets_at" (a Unix epoch, seconds) from the same
-# object and render a compact "~<time-left>" countdown (resets_at - now). now comes from
-# CCT_NOW when set (a deterministic test seam, unused in production) else `date +%s`. It
-# is a pure DURATION, so no timezone/clock math is needed. If now or resets_at is missing,
-# or the gap is beyond that window's own horizon (a per-window cap: ~6h for 5h, ~8d for
-# 7d), the countdown is omitted and the plain "5h NN%" stays. Never fabricated.
+# 5h/7d are ACCOUNT-WIDE, but Claude Code refreshes rate_limits only on an API call, so a
+# single session's payload is often stale and different open sessions disagree. To show ONE
+# coherent number we pick the FRESHEST reading for each window across ALL sessions'
+# telemetry-raw-*.json files (plus this render's payload): the reading with the largest
+# PLAUSIBLE resets_at (a window's reset boundary only moves forward), tie-broken by the
+# largest used_percentage (usage only grows within one window period). A non-epoch or
+# corrupt far-future resets_at is rejected so it cannot win. If NO reading carries a
+# resets_at (older Claude Code, or a synthetic payload) we fall back to THIS session's own
+# usage with no countdown. The countdown() logic is UNCHANGED; it just runs on the freshest
+# resets_at.
+#
+# now comes from CCT_NOW when set (a deterministic test seam, unused in production) else
+# `date +%s`; countdown is a pure DURATION so no timezone math. Bounded: ONE awk over (this
+# payload + the per-session raw files, whose count the reader prunes). No Node, no per-render
+# spawn beyond this single synchronous awk.
 now="${CCT_NOW:-$(date +%s 2>/dev/null)}"
 case "$now" in ""|*[!0-9]*) now="" ;; esac
-seg="$(awk -v now="$now" '
-  # Return the text INSIDE key '"'"'s object, via a running brace-depth count from the key.
-  # This assumes the REAL statusline schema, whose window objects hold only numbers (no
-  # braces inside string values). A literal { or } inside a string value would desync the
-  # count; that only ever makes this COSMETIC segment omit or truncate a field (it can
-  # still emit nothing but digits + fixed literals, never injected text), and the
-  # AUTHORITATIVE parse is index.js'"'"'s real JSON.parse. Do NOT rely on this brace-walk for
-  # correctness on adversarial JSON; it is a cheap display heuristic, fail-soft by design.
+
+# The account-wide pool: every session's raw file ON THIS MACHINE (one CCT_DIR; this does
+# not converge across devices). Safe glob (if none match, pass none), then DROP any
+# unreadable or non-regular entry: pure awk FATALS on a file it cannot open, which would
+# blank the WHOLE segment (losing even this session's ctx). We read foreign per-session
+# files we did not create this render, so a leftover root-owned file, a dangling symlink, or
+# a directory matching the glob must be skipped, not fatal. The positional list is CLEARED
+# after the awk (before the WRAP exec) so CCT_WRAP never inherits these paths as its argv.
+set -- "$dir"/telemetry-raw-*.json
+[ -e "$1" ] || set --
+n=$#
+while [ "$n" -gt 0 ]; do
+  f=$1; shift
+  [ -f "$f" ] && [ -r "$f" ] && set -- "$@" "$f"
+  n=$((n - 1))
+done
+
+# $tmp (this render's payload) is passed FIRST and identified by name (-v tmpf), so ctx and
+# the per-session fallback usage always come from THIS session even if another session's
+# file sorts first; $tmp also joins the pool (a failed raw-write still contributes it).
+seg="$(awk -v now="$now" -v tmpf="$tmp" '
+  # Text INSIDE key'"'"'s object, via a running brace-depth count. Assumes the real schema
+  # (window objects hold only numbers, no braces in string values); a stray brace only makes
+  # this COSMETIC segment omit/truncate a field (never injects), and index.js is authoritative.
   function objspan(key,   p, i, n, depth, start, c) {
     p = index(J, "\"" key "\"")
     if (p == 0) return ""
@@ -129,72 +139,74 @@ seg="$(awk -v now="$now" '
     }
     return ""
   }
-  # used_percentage that belongs to key directly: take key'"'"'s object, drop any nested
-  # objects (e.g. context_window'"'"'s current_usage), then read its own used_percentage.
   function up(key,   t) {
     t = objspan(key)
     if (t == "") return ""
     gsub(/\{[^{}]*\}/, "", t)
     if (match(t, /"used_percentage"[ \t]*:[ \t]*[0-9]+(\.[0-9]+)?/) == 0) return ""
-    t = substr(t, RSTART, RLENGTH)
-    sub(/.*:[ \t]*/, "", t)
-    return t
+    t = substr(t, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", t); return t
   }
-  function rnd(v) { if (v == "") return ""; return int(v + 0.5) }
-  # resets_at (a Unix epoch integer) belonging to key directly. Same objspan + nested-
-  # object strip as up(), but reads the integer "resets_at". Absent/null -> "" (no match),
-  # which makes the countdown omit cleanly.
   function resetsat(key,   t) {
     t = objspan(key)
     if (t == "") return ""
     gsub(/\{[^{}]*\}/, "", t)
     if (match(t, /"resets_at"[ \t]*:[ \t]*[0-9]+/) == 0) return ""
-    t = substr(t, RSTART, RLENGTH)
-    sub(/.*:[ \t]*/, "", t)
-    return t
+    t = substr(t, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", t); return t
   }
-  # Compact "~time-left" from an absolute reset epoch. Two units max; the leading unit is
-  # bare and the trailing unit shows ONLY when non-zero, so exact boundaries read "~5d" /
-  # "~2h" (never "~5d0h"). Tiers: days+hours at >= 1d, hours+minutes at >= 1h, bare
-  # minutes under 1h, "~<1m" under a minute, "~now" at or past reset. Omits (returns "")
-  # when: now/resets_at missing; resets_at is not a plausible epoch (< 1e9, e.g. a "1e12"
-  # value whose "[0-9]+" match grabbed only the leading "1" - guard against fabricating a
-  # bogus "~now"); or the gap exceeds maxsec, THIS window'"'"'s own horizon (~6h for the 5h
-  # window, ~8d for 7d), so a corrupt or foreign timestamp can never render "~6d" on a
-  # five-hour field. Never fabricates.
+  function rnd(v) { if (v == "") return ""; return int(v + 0.5) }
+  # Compact "~time-left" from an absolute reset epoch (UNCHANGED). Two units max; trailing
+  # unit shown only when non-zero; "~<1m" under a minute, "~now" at or past reset. Omits
+  # when now/resets_at missing, resets_at is not a plausible epoch (< 1e9), or the gap
+  # exceeds the window horizon maxsec.
   function countdown(rsat, maxsec,   sec, d, h, m) {
     if (rsat == "" || now == "") return ""
-    if (rsat + 0 < 1000000000) return ""   # not a plausible Unix epoch (misparse) -> omit
+    if (rsat + 0 < 1000000000) return ""
     sec = rsat - now
-    if (sec > maxsec) return ""            # beyond this window'"'"'s horizon -> corrupt/foreign, omit
+    if (sec > maxsec) return ""
     if (sec <= 0) return "~now"
     if (sec < 60) return "~<1m"
     if (sec < 3600) return "~" int(sec/60) "m"
-    if (sec < 86400) {
-      h = int(sec/3600); m = int((sec%3600)/60)
-      return (m == 0) ? ("~" h "h") : ("~" h "h" m "m")
-    }
-    d = int(sec/86400); h = int((sec%86400)/3600)
-    return (h == 0) ? ("~" d "d") : ("~" d "d" h "h")
+    if (sec < 86400) { h = int(sec/3600); m = int((sec%3600)/60); return (m == 0) ? ("~" h "h") : ("~" h "h" m "m") }
+    d = int(sec/86400); h = int((sec%86400)/3600); return (h == 0) ? ("~" d "d") : ("~" d "d" h "h")
   }
-  # Slurp ALL input lines into J and process ONCE in END, so a multi-line / pretty-
-  # printed payload is handled as a single record (concatenated) instead of the action
-  # running per line and garbling the segment. Claude Code emits single-line JSON, but
-  # this makes the cosmetic segment robust either way.
+  # Rank one file'"'"'s reading of a window into the account-wide freshest: keep the max
+  # PLAUSIBLE resets_at (within the window horizon), tie-broken by max used_percentage.
+  function consider(win, maxsec, reset, usage,   r) {
+    if (reset == "" || usage == "") return
+    r = reset + 0
+    if (r < 1e9 || r >= 1e11) return                    # not a plausible seconds-epoch
+    if (now != "" && r > now + maxsec) return           # corrupt far-future for this window
+    if (win == 5) { if (!h5 || r > r5 || (r == r5 && usage + 0 > u5 + 0)) { r5 = r; u5 = usage; h5 = 1 } }
+    else          { if (!h7 || r > r7 || (r == r7 && usage + 0 > u7 + 0)) { r7 = r; u7 = usage; h7 = 1 } }
+  }
+  function flush() {                                    # J holds one complete file'"'"'s payload
+    consider(5, 21600, resetsat("five_hour"), up("five_hour"))
+    consider(7, 691200, resetsat("seven_day"), up("seven_day"))
+    if (curfile == tmpf) Jtmp = J                       # remember THIS session for ctx + fallback
+    J = ""
+  }
+  FNR == 1 { if (NR > 1) flush(); curfile = FILENAME }
   { J = J $0 }
   END {
-    c = rnd(up("context_window")); h = rnd(up("five_hour")); d = rnd(up("seven_day"))
-    # Per-window horizon caps: a 5h reset is at most ~5h out (21600s = 6h, 1h skew slack),
-    # a 7d reset at most ~7d out (691200s = 8d slack). Beyond that the value is corrupt or
-    # a foreign timestamp, so it is omitted rather than shown as a nonsensical countdown.
-    hcd = countdown(resetsat("five_hour"), 21600); dcd = countdown(resetsat("seven_day"), 691200)
-    s = (c == "") ? "ctx --" : ("ctx " c "%")
-    if (h != "") { s = s " | 5h " h "%"; if (hcd != "") s = s " " hcd }
-    if (d != "") { s = s " | 7d " d "%"; if (dcd != "") s = s " " dcd }
+    flush()
+    J = Jtmp                                            # per-session values from THIS payload only
+    ctx = rnd(up("context_window")); f5 = rnd(up("five_hour")); f7 = rnd(up("seven_day"))
+    s = (ctx == "") ? "ctx --" : ("ctx " ctx "%")
+    # Use the cross-session ranked value ONLY when now is known; with now unset the
+    # far-future guard in consider() is disabled, so a corrupt reading could win - fall back
+    # to THIS session'"'"'s own usage (no countdown) in that case.
+    if (now != "" && h5) { s = s " | 5h " rnd(u5) "%"; cd = countdown(r5, 21600); if (cd != "") s = s " " cd }
+    else if (f5 != "")   { s = s " | 5h " f5 "%" }
+    if (now != "" && h7) { s = s " | 7d " rnd(u7) "%"; cd = countdown(r7, 691200); if (cd != "") s = s " " cd }
+    else if (f7 != "")   { s = s " | 7d " f7 "%" }
     printf "%s", s
   }
-' "$tmp" 2>/dev/null)"
+' "$tmp" "$@" 2>/dev/null)"
 [ -n "$seg" ] || seg="ctx --"
+
+# Clear the positional params (the account-wide file pool) so the CCT_WRAP command below,
+# run via `eval exec`, does NOT inherit these file paths as its argv ($@ / $1 / $#).
+set --
 
 # WRAP mode: PRINT our telemetry segment, then EXEC the wrapped statusline so its bar
 # appends on the SAME line ("ctx 66% | 5h 12% | 7d 30% <wrapped bar>"). Printing BEFORE

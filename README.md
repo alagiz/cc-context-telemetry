@@ -66,6 +66,12 @@ bridges that gap: a statusLine wrapper that prepends the `ctx % | 5h % | 7d %` s
 (each rate-limit field carrying a `~time-left` countdown to its reset) to your own bar and
 also writes that telemetry to a per-session file your hooks can read.
 
+`ctx` is per session. The 5h/7d rate limits are account-wide but Claude Code only refreshes
+them on an API call, so any single session's view is often stale. The bar therefore shows
+the FRESHEST 5h/7d reading across all your open sessions ON THIS MACHINE (the newest reset
+boundary, tie-broken by the highest usage), so your open sessions agree instead of showing
+different stale numbers. It does not converge across separate machines.
+
 One job, three pieces:
 
 - `bin/cct-statusline` - the POSIX shell entry Claude Code calls as its statusLine,
