@@ -75,10 +75,27 @@ CCT_SEGMENTS="model,ctx,5h,7d"    # model first
 CCT_SEGMENTS="5h,7d"              # just the rate limits
 ```
 
-Set it in the same `statusLine.env` block as `command` / `CCT_WRAP`.
+Set it in your `statusLine` env block in `~/.claude/settings.json`, next to `command` (and
+`CCT_WRAP` if you wrap an existing bar):
 
-> That is all you need for the bar. The rest is optional: how it works, then the API for
-> hooks and plugins that read this telemetry.
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "cc-context-telemetry-statusline",
+    "env": { "CCT_SEGMENTS": "ctx,5h,7d" }
+  }
+}
+```
+
+(Or export `CCT_SEGMENTS` in your shell profile instead.)
+
+## Uninstall
+
+Remove the `statusLine` block from `~/.claude/settings.json` (or set `command` back to your
+original statusline command, i.e. your `CCT_WRAP` value), then `npm uninstall -g
+cc-context-telemetry` (or delete your clone). Optionally clear the telemetry files with
+`rm -rf ~/.claude/cc-context-telemetry`.
 
 ## How it works
 
