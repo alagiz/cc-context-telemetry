@@ -140,9 +140,11 @@ One job, three pieces:
 - `bin/telemetry.js` - an on-demand CLI reader over `readTelemetry`, for the manual
   live check. It is NOT in the per-render path; it runs only when you invoke it.
 
-Zero third-party dependencies. The statusline path needs only a POSIX shell (Linux/macOS);
-Node >= 18 is required only for the hooks API (`readTelemetry`) and the `bin/telemetry.js`
-reader. Never throws, never calls `claude`.
+Zero third-party dependencies, and cross-platform (CI-tested on Linux, macOS, and Windows):
+the pure-POSIX-shell statusline path runs anywhere Claude Code does. On Windows, Claude Code
+runs statusLine commands through Git Bash, which ships the shell and tools it needs. Node
+>= 18 is required only for the hooks API (`readTelemetry`) and the `bin/telemetry.js` reader.
+Never throws, never calls `claude`.
 
 ## Consumer API (hooks)
 
