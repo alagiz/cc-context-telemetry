@@ -271,6 +271,69 @@ test('account-wide: with now unavailable, a corrupt far-future reading cannot wi
   assert.strictEqual(out, 'ctx 33% | 5h 20%', 'now unset -> this session (20%), not the corrupt 99%, no countdown');
 });
 
+// ============================================================================
+// (3d) SEGMENTS + MODEL: CCT_SEGMENTS is an ordered, comma/space list (default
+// "ctx,5h,7d,model"); order = display order, presence = toggle, unknown ignored.
+// The optional model segment is a short friendly token from model.id, sanitized.
+// ============================================================================
+
+const MDL_NOW = 1700000000;
+function segBar(payload, segsEnv) {
+  const dir = tmpDir();
+  const env = { CCT_DIR: dir, CCT_NOW: String(MDL_NOW) };
+  if (segsEnv !== undefined) env.CCT_SEGMENTS = segsEnv;
+  return runEntry(payload, env).stdout;
+}
+function fullPayload() {
+  return { session_id: 'M', context_window: { used_percentage: 48 },
+    rate_limits: { five_hour: { used_percentage: 14, resets_at: MDL_NOW + 4800 },
+      seven_day: { used_percentage: 21, resets_at: MDL_NOW + 470000 } },
+    model: { id: 'claude-opus-4-8[1m]' } };
+}
+const FULL = 'ctx 48% | 5h 14% ~1h20m | 7d 21% ~5d10h | opus-4.8[1m]';
+
+test('segments: default (unset) is ctx,5h,7d,model with model as a friendly token', function () {
+  assert.strictEqual(segBar(fullPayload(), undefined), FULL);
+});
+test('segments: empty CCT_SEGMENTS falls back to the default', function () {
+  assert.strictEqual(segBar(fullPayload(), ''), FULL);
+});
+test('segments: model OFF via CCT_SEGMENTS="ctx,5h,7d"', function () {
+  assert.strictEqual(segBar(fullPayload(), 'ctx,5h,7d'), 'ctx 48% | 5h 14% ~1h20m | 7d 21% ~5d10h');
+});
+test('segments: order honored and segments droppable', function () {
+  assert.strictEqual(segBar(fullPayload(), 'model,5h,7d'), 'opus-4.8[1m] | 5h 14% ~1h20m | 7d 21% ~5d10h');
+  assert.strictEqual(segBar(fullPayload(), '5h'), '5h 14% ~1h20m');
+});
+test('segments: unknown tokens are ignored (fail-soft)', function () {
+  assert.strictEqual(segBar(fullPayload(), 'ctx,bogus,5h'), 'ctx 48% | 5h 14% ~1h20m');
+});
+test('segments: model absent in the payload -> no model segment even if requested', function () {
+  assert.strictEqual(segBar({ session_id: 'M', context_window: { used_percentage: 48 } }, 'ctx,model'), 'ctx 48%');
+});
+test('model: friendly token strips claude- and dots the version', function () {
+  function m(id) {
+    return segBar({ session_id: 'M', context_window: { used_percentage: 5 }, model: { id: id } }, 'model');
+  }
+  assert.strictEqual(m('claude-opus-4-8'), 'opus-4.8');
+  assert.strictEqual(m('claude-opus-4-8[1m]'), 'opus-4.8[1m]');
+  assert.strictEqual(m('claude-fable-5'), 'fable-5');
+  assert.strictEqual(m('claude-sonnet-4-5'), 'sonnet-4.5');
+});
+test('model: SECURITY - a hostile model id is sanitized (no ESC/control/pipe/space reaches output)', function () {
+  const out = segBar({ session_id: 'M', context_window: { used_percentage: 5 },
+    model: { id: 'claude-[31mEVIL|7d 99%' } }, 'ctx,model');
+  assert.strictEqual(out.indexOf(''), -1, 'no ESC byte in output');
+  assert.ok(/^ctx 5% \| [A-Za-z0-9._[\]-]+$/.test(out), 'model token is safe chars only: ' + JSON.stringify(out));
+});
+
+test('model: SECURITY - LC_ALL=C strips high / non-ASCII bytes (C1 range) deterministically', function () {
+  const out = segBar({ session_id: 'M', context_window: { used_percentage: 5 },
+    model: { id: 'claude-opusé-4-8' } }, 'ctx,model');  // U+009B (C1 CSI) + accented byte
+  assert.ok(/^[\x20-\x7e]*$/.test(out), 'output is printable ASCII only: ' + JSON.stringify(out));
+  assert.strictEqual(out, 'ctx 5% | opus-4.8', 'high bytes stripped, id still resolves');
+});
+
 test('round-trip 1M window', function () {
   const dir = tmpDir(); process.env.CCT_DIR = dir;
   runEntry({ session_id: 's-1m', context_window: { used_percentage: 10, context_window_size: 1000000 },

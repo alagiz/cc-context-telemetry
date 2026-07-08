@@ -101,6 +101,11 @@ fi
 now="${CCT_NOW:-$(date +%s 2>/dev/null)}"
 case "$now" in ""|*[!0-9]*) now="" ;; esac
 
+# Which segments to show, and in what ORDER (CCT_SEGMENTS, comma or space separated).
+# Tokens: ctx, 5h, 7d, model. Order = display order; presence = shown. Unknown tokens are
+# ignored; unset or empty falls back to the default. This is the only knob for the layout.
+segs="${CCT_SEGMENTS:-ctx,5h,7d,model}"
+
 # The account-wide pool: every session's raw file ON THIS MACHINE (one CCT_DIR; this does
 # not converge across devices). Safe glob (if none match, pass none), then DROP any
 # unreadable or non-regular entry: pure awk FATALS on a file it cannot open, which would
@@ -120,7 +125,10 @@ done
 # $tmp (this render's payload) is passed FIRST and identified by name (-v tmpf), so ctx and
 # the per-session fallback usage always come from THIS session even if another session's
 # file sorts first; $tmp also joins the pool (a failed raw-write still contributes it).
-seg="$(awk -v now="$now" -v tmpf="$tmp" '
+# LC_ALL=C makes awk byte-wise: the model-id whitelist deterministically strips ALL
+# non-ASCII/high bytes (incl. the C1 0x80-0x9f range) across every awk and locale, and
+# number parsing uses a "." decimal regardless of the user's locale.
+seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
   # Text INSIDE key'"'"'s object, via a running brace-depth count. Assumes the real schema
   # (window objects hold only numbers, no braces in string values); a stray brace only makes
   # this COSMETIC segment omit/truncate a field (never injects), and index.js is authoritative.
@@ -154,6 +162,28 @@ seg="$(awk -v now="$now" -v tmpf="$tmp" '
     t = substr(t, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", t); return t
   }
   function rnd(v) { if (v == "") return ""; return int(v + 0.5) }
+  # The model id STRING (e.g. "claude-opus-4-8[1m]") from the model object. Unlike every
+  # other field this is display text, not a number, so it is SANITIZED before it can reach
+  # the terminal (strip control chars = defuse ANSI/escape injection from a hostile payload;
+  # strip spaces and "|" so a weird id cannot break the segment layout). Absent -> "".
+  function modelid(   t) {
+    t = objspan("model")
+    if (t == "") return ""
+    if (match(t, /"id"[ \t]*:[ \t]*"[^"]*"/) == 0) return ""
+    t = substr(t, RSTART, RLENGTH); sub(/.*"id"[ \t]*:[ \t]*"/, "", t); sub(/".*/, "", t)
+    gsub(/[^]A-Za-z0-9._[-]/, "", t)   # WHITELIST: only safe display chars survive (strips
+    return t                            # ANSI/ESC and any control byte, plus spaces/"|"/"%")
+  }
+  # Short friendly model token: drop the "claude-" prefix and dot the version (a digit-
+  # hyphen-digit becomes digit-dot-digit), so claude-opus-4-8[1m] -> opus-4.8[1m],
+  # claude-fable-5 -> fable-5. General rule, no per-model lookup table.
+  function friendlymodel(   m) {
+    m = modelid()
+    if (m == "") return ""
+    sub(/^claude-/, "", m)
+    while (match(m, /[0-9]-[0-9]/)) m = substr(m, 1, RSTART) "." substr(m, RSTART + 2)
+    return m
+  }
   # Compact "~time-left" from an absolute reset epoch (UNCHANGED). Two units max; trailing
   # unit shown only when non-zero; "~<1m" under a minute, "~now" at or past reset. Omits
   # when now/resets_at missing, resets_at is not a plausible epoch (< 1e9), or the gap
@@ -191,15 +221,27 @@ seg="$(awk -v now="$now" -v tmpf="$tmp" '
     flush()
     J = Jtmp                                            # per-session values from THIS payload only
     ctx = rnd(up("context_window")); f5 = rnd(up("five_hour")); f7 = rnd(up("seven_day"))
-    s = (ctx == "") ? "ctx --" : ("ctx " ctx "%")
-    # Use the cross-session ranked value ONLY when now is known; with now unset the
-    # far-future guard in consider() is disabled, so a corrupt reading could win - fall back
-    # to THIS session'"'"'s own usage (no countdown) in that case.
-    if (now != "" && h5) { s = s " | 5h " rnd(u5) "%"; cd = countdown(r5, 21600); if (cd != "") s = s " " cd }
-    else if (f5 != "")   { s = s " | 5h " f5 "%" }
-    if (now != "" && h7) { s = s " | 7d " rnd(u7) "%"; cd = countdown(r7, 691200); if (cd != "") s = s " " cd }
-    else if (f7 != "")   { s = s " | 7d " f7 "%" }
-    printf "%s", s
+    # Render each segment string once ("" = nothing to show for it). Cross-session ranked
+    # value only when now is known (else consider()'"'"'s far-future guard is off) - else fall
+    # back to THIS session'"'"'s own usage with no countdown.
+    ctxseg = (ctx == "") ? "ctx --" : ("ctx " ctx "%")
+    if (now != "" && h5) { fivehseg = "5h " rnd(u5) "%"; cd = countdown(r5, 21600); if (cd != "") fivehseg = fivehseg " " cd }
+    else if (f5 != "")   { fivehseg = "5h " f5 "%" }
+    if (now != "" && h7) { sevendseg = "7d " rnd(u7) "%"; cd = countdown(r7, 691200); if (cd != "") sevendseg = sevendseg " " cd }
+    else if (f7 != "")   { sevendseg = "7d " f7 "%" }
+    modelseg = friendlymodel()
+    # Assemble in the CCT_SEGMENTS order, joining the present segments with " | ".
+    k = split(segs, arr, /[ ,]+/)
+    out = ""
+    for (i = 1; i <= k; i++) {
+      p = ""
+      if (arr[i] == "ctx") p = ctxseg
+      else if (arr[i] == "5h") p = fivehseg
+      else if (arr[i] == "7d") p = sevendseg
+      else if (arr[i] == "model") p = modelseg
+      if (p != "") out = (out == "") ? p : (out " | " p)
+    }
+    printf "%s", out
   }
 ' "$tmp" "$@" 2>/dev/null)"
 [ -n "$seg" ] || seg="ctx --"

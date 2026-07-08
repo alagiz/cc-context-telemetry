@@ -54,6 +54,24 @@ statusline command; the segment then prepends to it on the same line:
 (If your Claude Code version does not accept an `env` block, export `CCT_WRAP` in your
 shell profile instead.)
 
+## Customizing the bar
+
+`CCT_SEGMENTS` picks which segments show and in what order - a comma (or space) separated
+list. Default: `ctx,5h,7d,model`. Order is the display order; presence toggles a segment on
+or off; unknown tokens are ignored; unset or empty uses the default. Tokens:
+
+- `ctx` - context window used %
+- `5h` / `7d` - Pro/Max rate-limit usage, each with a `~time-left` reset countdown
+- `model` - the current model as a short token (e.g. `opus-4.8[1m]`, `fable-5`)
+
+```bash
+CCT_SEGMENTS="ctx,5h,7d"          # drop the model
+CCT_SEGMENTS="model,ctx,5h,7d"    # model first
+CCT_SEGMENTS="5h,7d"              # just the rate limits
+```
+
+Set it in the same `statusLine.env` block as `command` / `CCT_WRAP`.
+
 > That is all you need for the bar. The rest is optional: how it works, then the API for
 > hooks and plugins that read this telemetry.
 
@@ -207,6 +225,8 @@ but a long-lived machine sees a new session id (UUID) per `claude` run. So
   directly). If you need a pipeline, put it in a small script and point `CCT_WRAP` at
   that script. When `CCT_WRAP` is unset, the entry prints its own minimal bar
   (`ctx 47% | 5h 12% ~3h | 7d 30% ~5d`).
+- `CCT_SEGMENTS` - which bar segments to show and in what order (default `ctx,5h,7d,model`);
+  see Customizing the bar.
 - `CCT_DIR` - telemetry directory (default `~/.claude/cc-context-telemetry/`). The
   shell entry mirrors this default; set it on the statusLine env AND for your hooks so
   both sides agree.
