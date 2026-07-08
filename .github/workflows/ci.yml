@@ -1,0 +1,36 @@
+name: CI
+
+# Cross-platform verification of the pure-shell statusLine entry + the Node consumer.
+# Linux/POSIX is already proven locally (bash, dash, busybox sh, Alpine musl, Debian
+# slim). This matrix adds the two platforms that cannot be run locally: macOS (BSD
+# userland: bwk awk, BSD sed/mktemp) and Windows (Git-Bash / MSYS `sh`, awk, sed).
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['20', '22']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # On Windows, run the tests through Git-Bash (bundled on the runner) so the
+      # harness resolves `sh` and the entry's POSIX tools (awk, sed, tr, mktemp,
+      # printf, mkdir, cp, mv, rm) are on PATH exactly as on macOS/Linux.
+      - name: Run tests
+        shell: bash
+        run: node test/run.js

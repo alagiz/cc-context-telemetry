@@ -22,17 +22,27 @@ const ROOT = path.join(__dirname, '..');
 const ENTRY = path.join(ROOT, 'bin', 'cct-statusline');   // the pure-shell entry
 const READER = path.join(ROOT, 'bin', 'telemetry.js');    // the on-demand CLI reader
 
-let pass = 0, fail = 0;
+// Cross-platform shell resolution. POSIX: /bin/sh. Windows: rely on Git-Bash `sh`
+// on PATH (the Windows CI job runs under `shell: bash`, which puts sh/awk/sed/printf
+// there). The pure-shell entry itself is POSIX and is exercised through this SH.
+const IS_WIN = process.platform === 'win32';
+const SH = IS_WIN ? 'sh' : '/bin/sh';
+
+let pass = 0, fail = 0, skip = 0;
 function test(name, fn) {
   try { fn(); pass++; console.log('ok   - ' + name); }
   catch (e) { fail++; console.log('FAIL - ' + name + '\n       ' + (e && e.message)); }
 }
+// A test that genuinely cannot hold on THIS platform (e.g. a Unix-process-model
+// assertion on Windows). Counted and printed VISIBLY so a skip never reads as a pass
+// and never silently vanishes from the totals.
+function skipTest(name, reason) { skip++; console.log('skip - ' + name + ' (' + reason + ')'); }
 function tmpDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'cct-test-')); }
 
 // Run the shell ENTRY with a stub payload on stdin (which CLOSES, as Claude Code
 // does) and the given env. Bounded by a short timeout.
 function runEntry(payload, env) {
-  return spawnSync('/bin/sh', [ENTRY], {
+  return spawnSync(SH, [ENTRY], {
     input: typeof payload === 'string' ? payload : JSON.stringify(payload),
     encoding: 'utf8', timeout: 10000,
     env: Object.assign({}, process.env, env),
@@ -688,6 +698,13 @@ test('wrap mode that backgrounds (trailing &) does NOT hang the entry', function
 //     command. NOTHING orphans. (The pile-up fix, in a shell harness.)
 // ============================================================================
 
+// This asserts a strictly Unix process-model property: exec replaces the process so a
+// SIGKILL to the entry tears down the wrapped command, and liveness is probed with
+// `kill -9`/`kill -0`/`$!`. None of that (signals, exec-replacement semantics, PID
+// probing) maps onto Windows, so it is SKIPPED there (visibly, counted), never faked.
+(IS_WIN ? function () {
+  skipTest('REGRESSION: killing the entry kills the EXECd wrapped command - no leak', 'Unix process model');
+} : function () {
 test('REGRESSION: killing the entry kills the EXECd wrapped command - no leak', function () {
   // A wrapped command records its pid then sleeps. Under the OLD spawn model the
   // wrapper spawned this DETACHED, so killing the wrapper (as Claude Code does every
@@ -714,9 +731,10 @@ test('REGRESSION: killing the entry kills the EXECd wrapped command - no leak', 
     'if [ -n "$hp" ] && kill -0 "$hp" 2>/dev/null; then echo LEAK; else echo OK; fi\n' +
     '[ -n "$hp" ] && kill -9 "$hp" 2>/dev/null\n' +  // belt-and-suspenders cleanup
     'exit 0\n');
-  const r = spawnSync('/bin/sh', [harness], { encoding: 'utf8', timeout: 15000 });
+  const r = spawnSync(SH, [harness], { encoding: 'utf8', timeout: 15000 });
   assert.ok(/\bOK\b/.test(r.stdout || ''), 'wrapped command torn down with the entry (NO leak); said: ' + JSON.stringify(r.stdout));
 });
+})();
 
 // ============================================================================
 // (6) SESSION_ID SANITIZATION: a hostile id cannot escape the dir (entry + api)
@@ -984,5 +1002,6 @@ test('CLI reader: no id and no stdin payload -> usage on stderr, exit 1', functi
   assert.ok(/usage:/.test(r.stderr));
 });
 
-console.log('\n' + pass + '/' + (pass + fail) + ' passed');
+console.log('\n' + pass + '/' + (pass + fail) + ' passed' +
+  (skip ? ' (' + skip + ' skipped: ' + (IS_WIN ? 'Windows' : process.platform) + ')' : ''));
 process.exit(fail === 0 ? 0 : 1);
