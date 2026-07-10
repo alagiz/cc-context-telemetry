@@ -23,8 +23,12 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Upgrade npm (OIDC trusted publishing support)
-        run: npm install -g npm@latest
+      - name: Upgrade npm (OIDC trusted publishing support; PINNED)
+        # Pinned, not npm@latest: npm 12.0.0's global install ships without the bundled
+        # `sigstore` module, so `npm publish --provenance` dies with
+        # "Cannot find module 'sigstore'". 11.18.0 is the newest known-good 11.x and still
+        # supports OIDC trusted publishing (>= 11.5.1). Bump deliberately, never to a moving tag.
+        run: npm install -g npm@11.18.0
 
       - name: Tests
         run: node test/run.js
