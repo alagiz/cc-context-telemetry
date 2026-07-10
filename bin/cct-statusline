@@ -81,23 +81,20 @@ fi
 # Shown PREPENDED in WRAP mode and as the whole bar in STANDALONE. No emoji (project rule).
 # Never blank. Cosmetic and fail-soft; the AUTHORITATIVE parse is index.js (real JSON.parse).
 #
-# ctx (context %) is PER SESSION: it comes only from THIS render's payload ($tmp).
+# ctx (context %) and the model token are PER SESSION: they come only from THIS render's
+# payload ($tmp).
 #
-# 5h/7d are ACCOUNT-WIDE, but Claude Code refreshes rate_limits only on an API call, so a
-# single session's payload is often stale and different open sessions disagree. To show ONE
-# coherent number we pick the FRESHEST reading for each window across ALL sessions'
-# telemetry-raw-*.json files (plus this render's payload): the reading with the largest
-# PLAUSIBLE resets_at (a window's reset boundary only moves forward), tie-broken by the
-# largest used_percentage (usage only grows within one window period). A non-epoch or
-# corrupt far-future resets_at is rejected so it cannot win. If NO reading carries a
-# resets_at (older Claude Code, or a synthetic payload) we fall back to THIS session's own
-# usage with no countdown. The countdown() logic is UNCHANGED; it just runs on the freshest
-# resets_at.
+# 5h/7d are ACCOUNT-WIDE. Claude Code refreshes rate_limits only when a session makes an API
+# call, so different open sessions disagree and a session that has not called recently keeps
+# reporting its OLD reading (even after a limit RESET, when usage has actually dropped). So we
+# do NOT pick by max usage or max resets_at (that would surface the STALEST session after a
+# reset). Instead each session records WHEN its own rate_limits last CHANGED in a per-session
+# tracker file (telemetry-rl-<sid>), and the picker chooses, per window, the reading whose
+# change is most recent ("latest API call wins"). See the tracker write + picker below.
 #
 # now comes from CCT_NOW when set (a deterministic test seam, unused in production) else
-# `date +%s`; countdown is a pure DURATION so no timezone math. Bounded: ONE awk over (this
-# payload + the per-session raw files, whose count the reader prunes). No Node, no per-render
-# spawn beyond this single synchronous awk.
+# `date +%s`; countdown is a pure DURATION so no timezone math. now must be valid for the
+# change tracker to stamp a TS and for the account-wide picker to run.
 now="${CCT_NOW:-$(date +%s 2>/dev/null)}"
 case "$now" in ""|*[!0-9]*) now="" ;; esac
 
@@ -106,32 +103,10 @@ case "$now" in ""|*[!0-9]*) now="" ;; esac
 # ignored; unset or empty falls back to the default. This is the only knob for the layout.
 segs="${CCT_SEGMENTS:-ctx,5h,7d,model}"
 
-# The account-wide pool: every session's raw file ON THIS MACHINE (one CCT_DIR; this does
-# not converge across devices). Safe glob (if none match, pass none), then DROP any
-# unreadable or non-regular entry: pure awk FATALS on a file it cannot open, which would
-# blank the WHOLE segment (losing even this session's ctx). We read foreign per-session
-# files we did not create this render, so a leftover root-owned file, a dangling symlink, or
-# a directory matching the glob must be skipped, not fatal. The positional list is CLEARED
-# after the awk (before the WRAP exec) so CCT_WRAP never inherits these paths as its argv.
-set -- "$dir"/telemetry-raw-*.json
-[ -e "$1" ] || set --
-n=$#
-while [ "$n" -gt 0 ]; do
-  f=$1; shift
-  [ -f "$f" ] && [ -r "$f" ] && set -- "$@" "$f"
-  n=$((n - 1))
-done
-
-# $tmp (this render's payload) is passed FIRST and identified by name (-v tmpf), so ctx and
-# the per-session fallback usage always come from THIS session even if another session's
-# file sorts first; $tmp also joins the pool (a failed raw-write still contributes it).
-# LC_ALL=C makes awk byte-wise: the model-id whitelist deterministically strips ALL
-# non-ASCII/high bytes (incl. the C1 0x80-0x9f range) across every awk and locale, and
-# number parsing uses a "." decimal regardless of the user's locale.
-seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
-  # Text INSIDE key'"'"'s object, via a running brace-depth count. Assumes the real schema
-  # (window objects hold only numbers, no braces in string values); a stray brace only makes
-  # this COSMETIC segment omit/truncate a field (never injects), and index.js is authoritative.
+# PHASE 1: extract THIS render's rate_limit reading as "5U|5R|7U|7R" (raw used_percentage +
+# reset epoch for five_hour|seven_day, empty string for an absent field), reusing the SAME
+# objspan/up/resetsat parse the segment awk uses. One awk over just this payload.
+cur="$(LC_ALL=C awk '
   function objspan(key,   p, i, n, depth, start, c) {
     p = index(J, "\"" key "\"")
     if (p == 0) return ""
@@ -161,22 +136,98 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     if (match(t, /"resets_at"[ \t]*:[ \t]*[0-9]+/) == 0) return ""
     t = substr(t, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", t); return t
   }
+  { J = J $0 }
+  END { printf "%s|%s|%s|%s", up("five_hour"), resetsat("five_hour"), up("seven_day"), resetsat("seven_day") }
+' "$tmp" 2>/dev/null)"
+
+# PHASE 2: update THIS session's change tracker BEFORE the picker scans, so the current
+# reading is represented. rate_limits change only on an API call, so we stamp TS = now ONLY
+# when the reading actually differs from what we stored (a byte-identical reading KEEPS its
+# old TS - it did not change). No rate_limits at all (cur == "|||") or an empty extraction:
+# nothing to track. Requires a valid now. Atomic write (temp in the same dir + mv), the same
+# pattern as the raw write; the "." prefix + $$ keeps concurrent renders from clobbering and
+# keeps the temp out of the picker glob (which does not match dotfiles).
+rl_final="$dir/telemetry-rl-$sid"
+case "$cur" in
+  ''|'|||') : ;;
+  *)
+    if [ -n "$now" ]; then
+      prev_line=""
+      if [ -f "$rl_final" ] && [ -r "$rl_final" ]; then
+        # `read` builtin: no per-render process. `|| :` keeps the partial content on a
+        # no-trailing-newline EOF (our writer emits no trailing newline).
+        IFS= read -r prev_line < "$rl_final" 2>/dev/null || :
+      fi
+      prev_vals="${prev_line#*|}"   # stored "5U|5R|7U|7R" = everything after the first "|"
+      if [ ! -f "$rl_final" ] || [ "$cur" != "$prev_vals" ]; then
+        rl_tmp="$dir/.telemetry-rl-$sid.$$.tmp"
+        if printf '%s|%s' "$now" "$cur" > "$rl_tmp" 2>/dev/null; then
+          mv -f "$rl_tmp" "$rl_final" 2>/dev/null || rm -f "$rl_tmp" 2>/dev/null || true
+        fi
+      fi
+    fi
+    ;;
+esac
+
+# PHASE 3 pool: every session's change tracker (telemetry-rl-*) in this CCT_DIR. Same safe
+# glob + readable/regular-file filter as the old raw pool: a dir, dangling symlink, or
+# unreadable entry matching the glob is SKIPPED, never fatal (awk FATALs on a file it cannot
+# open, which would blank the whole segment). The list is CLEARED after the awk so CCT_WRAP
+# never inherits these paths as its argv.
+set -- "$dir"/telemetry-rl-*
+[ -e "$1" ] || set --
+n=$#
+while [ "$n" -gt 0 ]; do
+  f=$1; shift
+  [ -f "$f" ] && [ -r "$f" ] && set -- "$@" "$f"
+  n=$((n - 1))
+done
+
+# PHASE 3 awk. ctx + model + the per-session FALLBACK usage come from THIS render's payload
+# ($tmp, passed FIRST and identified by -v tmpf). 5h/7d come from the account-wide picker
+# over the tracker pool: for EACH window independently, among tracker entries that HAVE that
+# window, whose resets_at is a plausible epoch (>=1e9, <1e11) and within the window horizon
+# (5h: <= now+21600 ; 7d: <= now+691200), take the one whose change TS is largest ("latest
+# API call wins"). No valid entry (or now invalid) -> fall back to THIS session's own usage
+# with NO countdown. LC_ALL=C makes awk byte-wise (the model-id whitelist strips all high/C1
+# bytes; numbers use a "." decimal regardless of locale). countdown() is UNCHANGED.
+seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
+  function objspan(key,   p, i, n, depth, start, c) {
+    p = index(J, "\"" key "\"")
+    if (p == 0) return ""
+    n = length(J); i = p
+    while (i <= n && substr(J, i, 1) != "{") i++
+    if (i > n) return ""
+    start = i; depth = 0
+    while (i <= n) {
+      c = substr(J, i, 1)
+      if (c == "{") depth++
+      else if (c == "}") { depth--; if (depth == 0) return substr(J, start + 1, i - start - 1) }
+      i++
+    }
+    return ""
+  }
+  function up(key,   t) {
+    t = objspan(key)
+    if (t == "") return ""
+    gsub(/\{[^{}]*\}/, "", t)
+    if (match(t, /"used_percentage"[ \t]*:[ \t]*[0-9]+(\.[0-9]+)?/) == 0) return ""
+    t = substr(t, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", t); return t
+  }
   function rnd(v) { if (v == "") return ""; return int(v + 0.5) }
-  # The model id STRING (e.g. "claude-opus-4-8[1m]") from the model object. Unlike every
-  # other field this is display text, not a number, so it is SANITIZED before it can reach
-  # the terminal (strip control chars = defuse ANSI/escape injection from a hostile payload;
-  # strip spaces and "|" so a weird id cannot break the segment layout). Absent -> "".
+  # The model id STRING from the model object. Unlike every other field this is display text,
+  # so it is SANITIZED before it can reach the terminal (strip control chars = defuse
+  # ANSI/escape injection; strip spaces and "|" so a weird id cannot break the layout).
   function modelid(   t) {
     t = objspan("model")
     if (t == "") return ""
     if (match(t, /"id"[ \t]*:[ \t]*"[^"]*"/) == 0) return ""
     t = substr(t, RSTART, RLENGTH); sub(/.*"id"[ \t]*:[ \t]*"/, "", t); sub(/".*/, "", t)
-    gsub(/[^]A-Za-z0-9._[-]/, "", t)   # WHITELIST: only safe display chars survive (strips
-    return t                            # ANSI/ESC and any control byte, plus spaces/"|"/"%")
+    gsub(/[^]A-Za-z0-9._[-]/, "", t)   # WHITELIST: only safe display chars survive
+    return t
   }
-  # Short friendly model token: drop the "claude-" prefix and dot the version (a digit-
-  # hyphen-digit becomes digit-dot-digit), so claude-opus-4-8[1m] -> opus-4.8[1m],
-  # claude-fable-5 -> fable-5. General rule, no per-model lookup table.
+  # Short friendly model token: drop the "claude-" prefix and dot the version (digit-hyphen-
+  # digit becomes digit-dot-digit), so claude-opus-4-8[1m] -> opus-4.8[1m]. No lookup table.
   function friendlymodel(   m) {
     m = modelid()
     if (m == "") return ""
@@ -185,9 +236,8 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     return m
   }
   # Compact "~time-left" from an absolute reset epoch (UNCHANGED). Two units max; trailing
-  # unit shown only when non-zero; "~<1m" under a minute, "~now" at or past reset. Omits
-  # when now/resets_at missing, resets_at is not a plausible epoch (< 1e9), or the gap
-  # exceeds the window horizon maxsec.
+  # unit shown only when non-zero; "~<1m" under a minute, "~now" at or past reset. Omits when
+  # now/resets_at missing, resets_at not a plausible epoch (< 1e9), or the gap exceeds maxsec.
   function countdown(rsat, maxsec,   sec, d, h, m) {
     if (rsat == "" || now == "") return ""
     if (rsat + 0 < 1000000000) return ""
@@ -199,31 +249,32 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     if (sec < 86400) { h = int(sec/3600); m = int((sec%3600)/60); return (m == 0) ? ("~" h "h") : ("~" h "h" m "m") }
     d = int(sec/86400); h = int((sec%86400)/3600); return (h == 0) ? ("~" d "d") : ("~" d "d" h "h")
   }
-  # Rank one file'"'"'s reading of a window into the account-wide freshest: keep the max
-  # PLAUSIBLE resets_at (within the window horizon), tie-broken by max used_percentage.
-  function consider(win, maxsec, reset, usage,   r) {
-    if (reset == "" || usage == "") return
-    r = reset + 0
-    if (r < 1e9 || r >= 1e11) return                    # not a plausible seconds-epoch
-    if (now != "" && r > now + maxsec) return           # corrupt far-future for this window
-    if (win == 5) { if (!h5 || r > r5 || (r == r5 && usage + 0 > u5 + 0)) { r5 = r; u5 = usage; h5 = 1 } }
-    else          { if (!h7 || r > r7 || (r == r7 && usage + 0 > u7 + 0)) { r7 = r; u7 = usage; h7 = 1 } }
+  # Rank one tracker entry into the per-window freshest by CHANGE TIME (largest TS wins).
+  # Guards: the value is present, resets_at is a plausible epoch, and (when now is valid) the
+  # reset is within the window horizon so a corrupt/foreign far-future reading cannot win.
+  function consider(win, ts, u, rsat,   r, t, cap) {
+    if (u == "" || rsat == "") return
+    r = rsat + 0
+    if (r < 1e9 || r >= 1e11) return
+    cap = (win == 5) ? 21600 : 691200
+    if (now != "" && r > now + cap) return
+    t = ts + 0
+    # TS is the ranking key, so it must be bounded: a change can only have happened in the
+    # PAST. Reject a FUTURE TS (> now + 60s slack for same-machine render jitter) so a corrupt
+    # tracker or a forward clock jump cannot pin the account-wide pick to a stale reading. No
+    # low-end floor is needed: a tiny/non-numeric TS coerces low and simply loses the max.
+    if (now != "" && t > now + 60) return
+    if (win == 5) { if (!h5 || t > ts5) { ts5 = t; u5 = u; r5 = r; h5 = 1 } }
+    else          { if (!h7 || t > ts7) { ts7 = t; u7 = u; r7 = r; h7 = 1 } }
   }
-  function flush() {                                    # J holds one complete file'"'"'s payload
-    consider(5, 21600, resetsat("five_hour"), up("five_hour"))
-    consider(7, 691200, resetsat("seven_day"), up("seven_day"))
-    if (curfile == tmpf) Jtmp = J                       # remember THIS session for ctx + fallback
-    J = ""
-  }
-  FNR == 1 { if (NR > 1) flush(); curfile = FILENAME }
-  { J = J $0 }
+  # Tracker files are single-line "TS|5U|5R|7U|7R"; parse the FIRST line of each. THIS render
+  # payload ($tmp) is JSON, accumulated into J for the per-session values instead.
+  FNR == 1 && FILENAME != tmpf { split($0, a, "|"); consider(5, a[1], a[2], a[3]); consider(7, a[1], a[4], a[5]) }
+  FILENAME == tmpf { J = J $0 }
   END {
-    flush()
-    J = Jtmp                                            # per-session values from THIS payload only
     ctx = rnd(up("context_window")); f5 = rnd(up("five_hour")); f7 = rnd(up("seven_day"))
-    # Render each segment string once ("" = nothing to show for it). Cross-session ranked
-    # value only when now is known (else consider()'"'"'s far-future guard is off) - else fall
-    # back to THIS session'"'"'s own usage with no countdown.
+    # Cross-session ranked value only when now is known (else the horizon guard is off) - else
+    # fall back to THIS session own usage with no countdown.
     ctxseg = (ctx == "") ? "ctx --" : ("ctx " ctx "%")
     if (now != "" && h5) { fivehseg = "5h " rnd(u5) "%"; cd = countdown(r5, 21600); if (cd != "") fivehseg = fivehseg " " cd }
     else if (f5 != "")   { fivehseg = "5h " f5 "%" }

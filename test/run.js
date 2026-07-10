@@ -174,111 +174,192 @@ test('reset epoch: implausible values rejected, matching the shell renderer', fu
 });
 
 // ============================================================================
-// (3c) ACCOUNT-WIDE rate limits: the statusline segment shows the FRESHEST 5h/7d
-// reading across ALL sessions' raw files (max plausible resets_at, tie-break max
-// usage), so open sessions do not diverge on the account-wide limits. ctx stays
-// per-session. Deterministic via CCT_NOW + pre-written raw files.
+// (3c) ACCOUNT-WIDE rate limits, "latest API call wins". rate_limits change ONLY when a
+// session makes an API call, so a session that has not called recently keeps reporting
+// its OLD reading (even after a limit RESET, when usage has actually dropped). Each
+// session records WHEN its own rate_limits last CHANGED in a tracker file
+// (telemetry-rl-<sid>, single line "TS|5U|5R|7U|7R"); the segment picks, per window
+// independently, the reading whose change TS is largest. This FIXES the prior reset bug
+// where a max-usage tie-break surfaced the STALEST session after a reset. ctx + model
+// stay per-session. Deterministic via CCT_NOW + pre-written tracker files.
 // ============================================================================
 
 const AW_NOW = 1700000000;
-function writeRaw(dir, sid, obj) {
-  fs.writeFileSync(path.join(dir, 'telemetry-raw-' + sid + '.json'), JSON.stringify(obj));
+// Pre-seed another session's rate-limit tracker line: "TS|5U|5R|7U|7R".
+function writeRl(dir, sid, line) {
+  fs.writeFileSync(path.join(dir, 'telemetry-rl-' + sid), line);
 }
-// Render `current` (this session's payload) in a dir seeded with `others` (other sessions).
-function awBar(current, others) {
+function rlFile(dir, sid) { return fs.readFileSync(path.join(dir, 'telemetry-rl-' + sid), 'utf8'); }
+// Render `current` (this session's payload) in a dir seeded with `trackers` (other
+// sessions' rl files: { sid, line }). nowVal pins CCT_NOW (default AW_NOW; pass a string
+// like 'garbage' to exercise an invalid now).
+function awBar(current, trackers, nowVal) {
   const dir = tmpDir();
-  (others || []).forEach(function (s) { writeRaw(dir, s.sid, s.obj); });
-  return runEntry(current, { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  (trackers || []).forEach(function (s) { writeRl(dir, s.sid, s.line); });
+  return runEntry(current, { CCT_DIR: dir, CCT_NOW: nowVal === undefined ? String(AW_NOW) : nowVal }).stdout;
 }
+// A ctx-only payload (no rate_limits) so THIS session writes no tracker and contributes
+// nothing to the picker - it sees only the pre-seeded trackers.
+function ctxOnly(pct) { return { session_id: 'C', context_window: { used_percentage: pct } }; }
 
-test('account-wide: 5h shows the FRESHEST reading across sessions, not this/stale one', function () {
-  const out = awBar(
-    { session_id: 'C', context_window: { used_percentage: 33 },
-      rate_limits: { five_hour: { used_percentage: 55, resets_at: AW_NOW - 3600 } } },
-    [ { sid: 'A', obj: { session_id: 'A', context_window: { used_percentage: 10 },
-          rate_limits: { five_hour: { used_percentage: 90, resets_at: AW_NOW - 7200 } } } },
-      { sid: 'B', obj: { session_id: 'B', context_window: { used_percentage: 20 },
-          rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW + 10800 } } } } ]);
-  assert.strictEqual(out, 'ctx 33% | 5h 12% ~3h', 'ctx from THIS session; 5h from freshest (B)');
+test('account-wide CORE (the reset bug): same resets_at, NEWEST change TS wins, not max usage', function () {
+  const R7 = AW_NOW + 3 * 86400; // 3d out, within the 7d horizon
+  // A changed at TS 1000 reporting 7d 34% (stale, pre-reset); B changed later at TS 2000
+  // reporting 7d 3% (fresh, post-reset). SAME resets_at. The old code picked max usage
+  // (34, the stalest); the fix picks the newest change (3).
+  const out = awBar(ctxOnly(33),
+    [ { sid: 'A', line: '1000|||34|' + R7 },
+      { sid: 'B', line: '2000|||3|' + R7 } ]);
+  assert.strictEqual(out, 'ctx 33% | 7d 3% ~3d', 'newest change (B, 3%) wins over stale high usage (A, 34%)');
 });
 
-test('account-wide: tie on resets_at -> higher usage wins (latest within the window)', function () {
-  const R = AW_NOW + 7200;
-  const out = awBar(
-    { session_id: 'C', context_window: { used_percentage: 33 },
-      rate_limits: { five_hour: { used_percentage: 40, resets_at: R } } },
-    [ { sid: 'B', obj: { session_id: 'B', context_window: { used_percentage: 20 },
-          rate_limits: { five_hour: { used_percentage: 71, resets_at: R } } } } ]);
-  assert.strictEqual(out, 'ctx 33% | 5h 71% ~2h', 'same reset -> max usage (71) wins');
+test('account-wide: 5h picks the reading with the newest change TS, not this or a stale one', function () {
+  const R = AW_NOW + 3600;
+  const out = awBar(ctxOnly(33),
+    [ { sid: 'A', line: '1000|90|' + R + '||' },     // old change, high usage
+      { sid: 'B', line: '2000|12|' + R + '||' } ]);  // newest change, low usage
+  assert.strictEqual(out, 'ctx 33% | 5h 12% ~1h', 'newest change (B, 12%) wins; ctx from THIS session');
 });
 
-test('account-wide: a corrupt far-future resets_at does not win selection', function () {
+test('account-wide: a FUTURE / huge change TS is rejected (corrupt tracker or clock jump cannot pin the pick)', function () {
+  const R = AW_NOW + 3600;
+  const out = awBar(ctxOnly(40),
+    [ { sid: 'B', line: '2000|5|' + R + '||' },              // legit past change, low usage
+      { sid: 'X', line: '99999999999|95|' + R + '||' } ]);   // absurd future TS, high usage
+  assert.strictEqual(out, 'ctx 40% | 5h 5% ~1h', 'future-TS tracker excluded; the legit past-change reading wins');
+});
+
+test('account-wide: a far-future resets_at is rejected even with the newest TS + highest usage', function () {
   const out = awBar(
     { session_id: 'C', context_window: { used_percentage: 33 },
       rate_limits: { five_hour: { used_percentage: 20, resets_at: AW_NOW + 3600 } } },
-    [ { sid: 'X', obj: { session_id: 'X', context_window: { used_percentage: 5 },
-          rate_limits: { five_hour: { used_percentage: 99, resets_at: AW_NOW + 5 * 86400 } } } } ]);
-  assert.strictEqual(out, 'ctx 33% | 5h 20% ~1h', 'far-future (5d for a 5h window) rejected; legit 1h wins');
+    [ { sid: 'X', line: '9999999999|99|' + (AW_NOW + 5 * 86400) + '||' } ]);
+  assert.strictEqual(out, 'ctx 33% | 5h 20% ~1h', 'far-future 5h reset (5d) rejected; this session (20%) wins');
 });
 
-test('account-wide: all sessions stale -> least-stale usage, countdown honestly ~now', function () {
+test('account-wide: all trackers have a past reset -> newest change wins, countdown honestly ~now', function () {
+  const out = awBar(ctxOnly(33),
+    [ { sid: 'A', line: '1000|80|' + (AW_NOW - 3600) + '||' },
+      { sid: 'B', line: '2000|60|' + (AW_NOW - 7200) + '||' } ]);
+  assert.strictEqual(out, 'ctx 33% | 5h 60% ~now', 'newest change (B) wins even with a further-past reset; ~now');
+});
+
+test('account-wide: ctx + model always come from THIS session, never a tracker', function () {
   const out = awBar(
-    { session_id: 'C', context_window: { used_percentage: 33 },
-      rate_limits: { five_hour: { used_percentage: 60, resets_at: AW_NOW - 7200 } } },
-    [ { sid: 'A', obj: { session_id: 'A', context_window: { used_percentage: 10 },
-          rate_limits: { five_hour: { used_percentage: 80, resets_at: AW_NOW - 3600 } } } } ]);
-  assert.strictEqual(out, 'ctx 33% | 5h 80% ~now', 'newest reset among stale wins; ~now untouched');
+    { session_id: 'C', context_window: { used_percentage: 7 }, model: { id: 'claude-opus-4-8' } },
+    [ { sid: 'B', line: '2000|12|' + (AW_NOW + 3600) + '||' } ]);
+  assert.strictEqual(out, 'ctx 7% | 5h 12% ~1h | opus-4.8', 'ctx 7 + model from C; 5h 12 from tracker B');
 });
 
-test('account-wide: ctx is always THIS session, never another', function () {
-  const out = awBar(
-    { session_id: 'C', context_window: { used_percentage: 7 } },
-    [ { sid: 'B', obj: { session_id: 'B', context_window: { used_percentage: 88 },
-          rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW + 3600 } } } } ]);
-  assert.strictEqual(out, 'ctx 7% | 5h 12% ~1h', 'ctx 7 from THIS session, not 88 from B');
+test('account-wide: 5h and 7d are each selected independently by their own newest change TS', function () {
+  const R5 = AW_NOW + 3600, R7 = AW_NOW + 3 * 86400;
+  const out = awBar(ctxOnly(33),
+    [ { sid: 'P', line: '6000|15|' + R5 + '||' },              // newest 5h holder (no 7d)
+      { sid: 'Q', line: '5000|99|' + R5 + '|40|' + R7 } ]);    // older, has 5h(99) + 7d(40)
+  assert.strictEqual(out, 'ctx 33% | 5h 15% ~1h | 7d 40% ~3d',
+    '5h from P (newest TS, 15) over Q (older, higher 99); 7d only Q has it (40)');
 });
 
-test('account-wide: 5h and 7d each pick their own freshest session independently', function () {
-  const out = awBar(
-    { session_id: 'C', context_window: { used_percentage: 33 },
-      rate_limits: { five_hour: { used_percentage: 50, resets_at: AW_NOW - 100 },
-        seven_day: { used_percentage: 40, resets_at: AW_NOW + 3 * 86400 } } },
-    [ { sid: 'B', obj: { session_id: 'B', context_window: { used_percentage: 20 },
-          rate_limits: { five_hour: { used_percentage: 15, resets_at: AW_NOW + 7200 } } } } ]);
-  assert.strictEqual(out, 'ctx 33% | 5h 15% ~2h | 7d 40% ~3d', '5h freshest from B, 7d from this session');
-});
+// The tracker file itself: written on first render, TS preserved when unchanged, restamped
+// on a real change (an API call moved the reading).
 
-// Regression tests for the review-gate findings on the account-wide pool.
-
-test('account-wide: an unreadable or non-regular pool file is SKIPPED, segment stays intact', function () {
+test('tracker: written on first render as "now|5U|5R|7U|7R"', function () {
   const dir = tmpDir();
-  fs.mkdirSync(path.join(dir, 'telemetry-raw-adir.json'));   // a dir matching the glob (non-regular)
-  const bad = path.join(dir, 'telemetry-raw-bad.json');
-  fs.writeFileSync(bad, '{}'); fs.chmodSync(bad, 0);          // an unreadable file
+  runEntry({ session_id: 'T', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW + 3600 },
+      seven_day: { used_percentage: 30, resets_at: AW_NOW + 100000 } } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW) });
+  assert.strictEqual(rlFile(dir, 'T'),
+    AW_NOW + '|12|' + (AW_NOW + 3600) + '|30|' + (AW_NOW + 100000),
+    'tracker line = TS(now)|5U|5R|7U|7R');
+});
+
+test('tracker: NOT rewritten when the reading is byte-identical across renders (TS preserved)', function () {
+  const dir = tmpDir();
+  const payload = { session_id: 'T2', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW + 3600 } } };
+  runEntry(payload, { CCT_DIR: dir, CCT_NOW: String(AW_NOW) });
+  const first = rlFile(dir, 'T2');
+  // Second render, SAME rate_limits, LATER now: the reading did not change, so its change
+  // TS must NOT advance (the byte-identical reading keeps the original TS).
+  runEntry(payload, { CCT_DIR: dir, CCT_NOW: String(AW_NOW + 500) });
+  assert.strictEqual(rlFile(dir, 'T2'), first, 'unchanged reading keeps its original TS');
+  assert.strictEqual(first, AW_NOW + '|12|' + (AW_NOW + 3600) + '||', 'sanity: TS is the FIRST now');
+});
+
+test('tracker: restamped with a NEW TS when a value changes (an API call happened)', function () {
+  const dir = tmpDir();
+  runEntry({ session_id: 'T3', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW + 3600 } } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW) });
+  runEntry({ session_id: 'T3', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 15, resets_at: AW_NOW + 3600 } } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW + 500) });
+  assert.strictEqual(rlFile(dir, 'T3'), (AW_NOW + 500) + '|15|' + (AW_NOW + 3600) + '||',
+    'changed reading -> new TS + new value');
+});
+
+test('tracker: NOT written at all when the payload has no rate_limits (cur is empty)', function () {
+  const dir = tmpDir();
+  runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) });
+  assert.strictEqual(fs.existsSync(path.join(dir, 'telemetry-rl-C')), false, 'no rate_limits -> no tracker');
+});
+
+// Fallback semantics: when the picker finds no valid entry for a window (now invalid, or
+// the only readings have an implausible / absent resets_at) it falls back to THIS session's
+// own usage from the current payload, with NO countdown.
+
+test('account-wide fallback: now invalid -> THIS session usage, no countdown (tracker ignored)', function () {
+  const out = awBar(
+    { session_id: 'C', context_window: { used_percentage: 33 },
+      rate_limits: { five_hour: { used_percentage: 20, resets_at: AW_NOW + 3600 } } },
+    [ { sid: 'X', line: '9999|99|' + (AW_NOW + 3600) + '||' } ],
+    'garbage');
+  assert.strictEqual(out, 'ctx 33% | 5h 20%', 'now unset -> current session 20%, not tracker 99%, no countdown');
+});
+
+test('account-wide fallback: an implausible resets_at -> THIS session %, no countdown', function () {
+  const out = awBar(
+    { session_id: 'C', context_window: { used_percentage: 33 },
+      rate_limits: { five_hour: { used_percentage: 20, resets_at: 12345 } } }, []);
+  assert.strictEqual(out, 'ctx 33% | 5h 20%', 'implausible reset rejected by the picker; fall back to 20%, no countdown');
+});
+
+test('account-wide fallback: resets_at absent -> THIS session %, no countdown', function () {
+  const out = awBar(
+    { session_id: 'C', context_window: { used_percentage: 33 },
+      rate_limits: { five_hour: { used_percentage: 20 } } }, []);
+  assert.strictEqual(out, 'ctx 33% | 5h 20%', 'no reset -> plain 20%, no countdown');
+});
+
+test('account-wide: a single session with no other trackers renders normally', function () {
+  const out = runEntry({ session_id: 'solo', context_window: { used_percentage: 48 },
+    rate_limits: { five_hour: { used_percentage: 14, resets_at: AW_NOW + 4800 },
+      seven_day: { used_percentage: 21, resets_at: AW_NOW + 470000 } } },
+    { CCT_DIR: tmpDir(), CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 48% | 5h 14% ~1h20m | 7d 21% ~5d10h', 'single session picks its own reading');
+});
+
+// Regression tests for the pool hygiene (now over the tracker files).
+
+test('account-wide: an unreadable or non-regular tracker file is SKIPPED, segment stays intact', function () {
+  const dir = tmpDir();
+  fs.mkdirSync(path.join(dir, 'telemetry-rl-adir'));      // a dir matching the glob (non-regular)
+  const bad = path.join(dir, 'telemetry-rl-bad');
+  fs.writeFileSync(bad, '2000|99|' + (AW_NOW + 3600) + '||'); fs.chmodSync(bad, 0);  // unreadable
   const out = runEntry({ session_id: 'C', context_window: { used_percentage: 33 },
     rate_limits: { five_hour: { used_percentage: 20, resets_at: AW_NOW + 3600 } } },
     { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
   fs.chmodSync(bad, 0o644);  // restore so the temp entry is not left unreadable
-  assert.strictEqual(out, 'ctx 33% | 5h 20% ~1h', 'bad pool entries skipped, not fatal');
+  assert.strictEqual(out, 'ctx 33% | 5h 20% ~1h', 'bad tracker entries skipped, not fatal; this session (20%) shows');
 });
 
-test('account-wide: the file pool is NOT leaked to CCT_WRAP as positional args', function () {
+test('account-wide: the tracker pool is NOT leaked to CCT_WRAP as positional args', function () {
   const dir = tmpDir();
-  writeRaw(dir, 'B', { session_id: 'B', context_window: { used_percentage: 20 },
-    rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW + 3600 } } });
+  writeRl(dir, 'B', '2000|12|' + (AW_NOW + 3600) + '||');
   const r = runEntry({ session_id: 'C', context_window: { used_percentage: 33 } },
     { CCT_DIR: dir, CCT_NOW: String(AW_NOW), CCT_WRAP: 'printf "[argc=%s]" "$#"' });
   assert.strictEqual(r.stdout, 'ctx 33% | 5h 12% ~1h [argc=0]', 'CCT_WRAP sees no argv from the glob');
-});
-
-test('account-wide: with now unavailable, a corrupt far-future reading cannot win (falls back)', function () {
-  const dir = tmpDir();
-  writeRaw(dir, 'X', { session_id: 'X', context_window: { used_percentage: 5 },
-    rate_limits: { five_hour: { used_percentage: 99, resets_at: 50000000000 } } });  // corrupt, in [1e9,1e11)
-  const out = runEntry({ session_id: 'C', context_window: { used_percentage: 33 },
-    rate_limits: { five_hour: { used_percentage: 20, resets_at: AW_NOW + 3600 } } },
-    { CCT_DIR: dir, CCT_NOW: 'garbage' }).stdout;  // non-numeric -> now=""
-  assert.strictEqual(out, 'ctx 33% | 5h 20%', 'now unset -> this session (20%), not the corrupt 99%, no countdown');
 });
 
 // ============================================================================
@@ -862,6 +943,55 @@ test('pruneRaw only touches telemetry-raw-* files, never others', function () {
   assert.strictEqual(fs.existsSync(other), true, 'unrelated file untouched');
   assert.strictEqual(fs.existsSync(legacy), true, 'legacy parsed file untouched');
   assert.strictEqual(fs.existsSync(raw), false, 'stale raw file pruned');
+  delete process.env.CCT_DIR;
+});
+
+test('pruneRaw prunes stale telemetry-rl-* trackers by age, keeps fresh ones', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  api.ensureDir();
+  const oldRl = path.join(dir, 'telemetry-rl-old');
+  const freshRl = path.join(dir, 'telemetry-rl-fresh');
+  fs.writeFileSync(oldRl, '1000|5|1700003600||');
+  fs.writeFileSync(freshRl, '2000|5|1700003600||');
+  const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(oldRl, twoDaysAgo, twoDaysAgo);
+  api.pruneRaw();
+  assert.strictEqual(fs.existsSync(oldRl), false, 'stale tracker pruned');
+  assert.strictEqual(fs.existsSync(freshRl), true, 'fresh tracker kept');
+  delete process.env.CCT_DIR;
+});
+
+test('pruneRaw caps telemetry-rl-* independently of telemetry-raw-*', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  process.env.CCT_PRUNE_MAX_FILES = '2';
+  api.ensureDir();
+  const base = Date.now();
+  for (let i = 0; i < 4; i++) {
+    const p = path.join(dir, 'telemetry-rl-s' + i);
+    fs.writeFileSync(p, '1000|5|1700003600||');
+    const t = (base - i * 1000) / 1000; // s0 newest, s3 oldest
+    fs.utimesSync(p, t, t);
+  }
+  // Two raw files: capped by their OWN pool (cap 2), so both survive - the caps are separate.
+  fs.writeFileSync(path.join(dir, 'telemetry-raw-r0.json'), '{}');
+  fs.writeFileSync(path.join(dir, 'telemetry-raw-r1.json'), '{}');
+  api.pruneRaw();
+  const rl = fs.readdirSync(dir).filter(function (f) { return f.indexOf('telemetry-rl-') === 0; }).sort();
+  const raw = fs.readdirSync(dir).filter(function (f) { return f.indexOf('telemetry-raw-') === 0; }).sort();
+  assert.deepStrictEqual(rl, ['telemetry-rl-s0', 'telemetry-rl-s1'], 'rl pool capped to the 2 newest');
+  assert.strictEqual(raw.length, 2, 'raw pool capped independently (both survive under its own cap of 2)');
+  delete process.env.CCT_PRUNE_MAX_FILES; delete process.env.CCT_DIR;
+});
+
+test('pruneRaw reclaims a STALE telemetry-rl-* atomic-write .tmp leftover', function () {
+  const dir = tmpDir(); process.env.CCT_DIR = dir;
+  api.ensureDir();
+  const staleTmp = path.join(dir, '.telemetry-rl-s.12345.tmp');
+  fs.writeFileSync(staleTmp, '1000|5|1700003600||');
+  const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(staleTmp, twoDaysAgo, twoDaysAgo);
+  api.pruneRaw();
+  assert.strictEqual(fs.existsSync(staleTmp), false, 'stale rl crash-leftover .tmp reclaimed');
   delete process.env.CCT_DIR;
 });
 

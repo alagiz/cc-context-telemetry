@@ -66,21 +66,24 @@ function ensureDir() {
 
 function nowIso() { return new Date().toISOString(); }
 
-// Raw-file hygiene. The shell entry writes one telemetry-raw-<session>.json per
-// session, overwriting it each render, so a single live session never grows the dir.
-// But a long-lived machine accumulates one file per session id seen over time (each
-// `claude` invocation is a new UUID), and nothing on the hot path prunes them. So the
-// READER prunes here, OFF the per-render hot path: pruning runs only when a hook
-// actually calls readTelemetry (best-effort, never throws, never blocks output).
+// Raw-file hygiene. The shell entry writes one telemetry-raw-<session>.json AND one
+// telemetry-rl-<session> (the rate-limit change tracker) per session, overwriting them
+// each render, so a single live session never grows the dir. But a long-lived machine
+// accumulates one of each per session id seen over time (each `claude` invocation is a
+// new UUID), and nothing on the hot path prunes them. So the READER prunes here, OFF the
+// per-render hot path: pruning runs only when a hook actually calls readTelemetry
+// (best-effort, never throws, never blocks output).
 //
-// Bounded two-rule prune over ONLY this lib's own raw files (telemetry-raw-*.json):
-//   1. delete any raw file whose mtime is older than CCT_PRUNE_AGE_SEC (default 1 day)
+// Bounded two-rule prune over ONLY this lib's own state files, applied to the raw pool
+// (telemetry-raw-*.json) AND the tracker pool (telemetry-rl-*) INDEPENDENTLY:
+//   1. delete any file whose mtime is older than CCT_PRUNE_AGE_SEC (default 1 day)
 //      - a session untouched for that long is dead,
-//   2. then, if more than CCT_PRUNE_MAX_FILES (default 200) remain, delete the oldest
-//      until at most MAX remain - a hard cap so the dir can never grow without bound.
-// The cost is one readdir + lstat per raw file; bounded by the cap and only paid on a
-// reader call. We NEVER touch files we did not create (only the telemetry-raw- prefix,
-// not the legacy telemetry- file the consumer may stub, not the user's other files).
+//   2. then, if more than CCT_PRUNE_MAX_FILES (default 200) remain in that pool, delete
+//      the oldest until at most MAX remain - a hard cap so the dir can never grow without
+//      bound.
+// The cost is one readdir + lstat per file; bounded by the cap and only paid on a reader
+// call. We NEVER touch files we did not create (only the telemetry-raw- / telemetry-rl-
+// prefixes, not the legacy telemetry- file the consumer may stub, not the user's files).
 const DEFAULT_PRUNE_AGE_SEC = 24 * 60 * 60; // 1 day
 const DEFAULT_PRUNE_MAX_FILES = 200;
 
@@ -115,6 +118,17 @@ function pruneThrottled(force) {
   } catch (e) { /* best-effort */ }
 }
 
+// Rule 2 helper: hard count cap. Delete the OLDEST surviving files in a pool beyond MAX.
+function capPool(live, maxFiles) {
+  if (live.length > maxFiles) {
+    live.sort(function (a, b) { return a.mtimeMs - b.mtimeMs; }); // oldest first
+    const toDelete = live.length - maxFiles;
+    for (let i = 0; i < toDelete; i++) {
+      try { fs.unlinkSync(live[i].path); } catch (e) {}
+    }
+  }
+}
+
 function pruneRaw() {
   try {
     const dir = telemetryDir();
@@ -124,14 +138,17 @@ function pruneRaw() {
     const maxFiles = posIntEnv('CCT_PRUNE_MAX_FILES', DEFAULT_PRUNE_MAX_FILES);
     const now = Date.now();
     const cutoff = now - ageSec * 1000;
-    const live = []; // { path, mtimeMs } for raw files that survive the age rule
+    const liveRaw = []; // { path, mtimeMs } for raw files that survive the age rule
+    const liveRl = [];  // same, for the rate-limit tracker files (telemetry-rl-*)
     for (let i = 0; i < names.length; i++) {
       const name = names[i];
-      // Reclaim a stale atomic-write temp left by a crash BETWEEN cp and mv (the shell
+      // Reclaim a stale atomic-write temp left by a crash BETWEEN write and mv (the shell
       // removes its own temp on a normal mv-failure, so this only catches a hard crash
-      // mid-write). The temp is ".telemetry-raw-<sid>.<pid>.tmp" (leading dot). Only
-      // OUR temps, only when old, so a temp from an in-flight write is never touched.
-      if (name.indexOf('.telemetry-raw-') === 0 && name.slice(-4) === '.tmp') {
+      // mid-write). The temps are ".telemetry-raw-<sid>.<pid>.tmp" and
+      // ".telemetry-rl-<sid>.<pid>.tmp" (leading dot). Only OUR temps, only when old, so a
+      // temp from an in-flight write is never touched.
+      if ((name.indexOf('.telemetry-raw-') === 0 || name.indexOf('.telemetry-rl-') === 0)
+          && name.slice(-4) === '.tmp') {
         const tp = path.join(dir, name);
         try {
           const tst = fs.lstatSync(tp);
@@ -139,9 +156,12 @@ function pruneRaw() {
         } catch (e) {}
         continue;
       }
-      // ONLY our own raw payload files for the main rules.
-      if (name.indexOf('telemetry-raw-') !== 0) continue;
-      if (name.slice(-5) !== '.json') continue;
+      // ONLY our own state files for the main rules: raw payloads (telemetry-raw-*.json)
+      // and rate-limit trackers (telemetry-rl-*, no extension). Route each into its pool.
+      let live;
+      if (name.indexOf('telemetry-raw-') === 0 && name.slice(-5) === '.json') live = liveRaw;
+      else if (name.indexOf('telemetry-rl-') === 0) live = liveRl;
+      else continue;
       const p = path.join(dir, name);
       let st;
       try { st = fs.lstatSync(p); } catch (e) { continue; }
@@ -154,14 +174,9 @@ function pruneRaw() {
       }
       live.push({ path: p, mtimeMs: st.mtimeMs });
     }
-    // Rule 2: hard count cap. Delete the OLDEST surviving files beyond the cap.
-    if (live.length > maxFiles) {
-      live.sort(function (a, b) { return a.mtimeMs - b.mtimeMs; }); // oldest first
-      const toDelete = live.length - maxFiles;
-      for (let i = 0; i < toDelete; i++) {
-        try { fs.unlinkSync(live[i].path); } catch (e) {}
-      }
-    }
+    // Rule 2: hard count cap, applied to each pool independently.
+    capPool(liveRaw, maxFiles);
+    capPool(liveRl, maxFiles);
   } catch (e) { /* hygiene is best-effort; never affect the reader */ }
 }
 
