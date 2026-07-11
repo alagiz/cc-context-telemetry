@@ -116,10 +116,13 @@ bridges that gap: a statusLine wrapper that prepends a compact segment - context
 per-session file your hooks can read.
 
 `ctx` is per session. The 5h/7d rate limits are account-wide but Claude Code only refreshes
-them on an API call, so any single session's view is often stale. The bar therefore shows
-the FRESHEST 5h/7d reading across all your open sessions ON THIS MACHINE (the newest reset
-boundary, tie-broken by the highest usage), so your open sessions agree instead of showing
-different stale numbers. It does not converge across separate machines.
+them on an API call, so any single session's view is often stale. The bar therefore shows,
+per window, the reading from whichever of your open sessions ON THIS MACHINE refreshed most
+recently ("latest API call wins": each session tracks when its rate_limits last changed, and
+the newest change is picked). A reading whose reset boundary already elapsed is treated as
+stale and never picked; if no session has a current reading for a window, the bar falls back
+to this session's last-known usage with no countdown. So your open sessions agree instead of
+showing different stale numbers. It does not converge across separate machines.
 
 One job, three pieces:
 
@@ -232,10 +235,12 @@ after a compaction (so `contextPct` is `null` and `fresh` is `false`).
 
 Each `rate_limits` window also carries `resets_at` (a Unix epoch, seconds). The shell
 segment renders it as a compact `~time-left` countdown next to the percent: at most two
-units (`~6d23h`, `~2h54m`, `~44m`, `~<1m`), and `~now` at or past the reset. It is a pure
-duration (reset minus `date +%s`), so there is no clock or timezone handling, and it is
-omitted whenever `resets_at` is missing (older Claude Code, or non-OAuth plans) or
-implausible - never fabricated. (`readTelemetry` surfaces these reset epochs too, as
+units (`~6d23h`, `~2h54m`, `~44m`, `~<1m`). It is a pure duration (reset minus `date +%s`),
+so there is no clock or timezone handling. The countdown is omitted whenever `resets_at` is
+missing (older Claude Code, or non-OAuth plans), implausible, or already in the past (a
+reading whose reset boundary elapsed predates the last reset, so it is treated as stale: the
+countdown is dropped and the bar shows this session's last-known usage % without one) -
+never fabricated. (`readTelemetry` surfaces these reset epochs too, as
 `fiveHourResetsAt` / `sevenDayResetsAt`; see the Consumer API section.)
 
 ### Raw-file hygiene

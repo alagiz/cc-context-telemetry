@@ -141,27 +141,45 @@ cur="$(LC_ALL=C awk '
 ' "$tmp" 2>/dev/null)"
 
 # PHASE 2: update THIS session's change tracker BEFORE the picker scans, so the current
-# reading is represented. rate_limits change only on an API call, so we stamp TS = now ONLY
-# when the reading actually differs from what we stored (a byte-identical reading KEEPS its
-# old TS - it did not change). No rate_limits at all (cur == "|||") or an empty extraction:
-# nothing to track. Requires a valid now. Atomic write (temp in the same dir + mv), the same
-# pattern as the raw write; the "." prefix + $$ keeps concurrent renders from clobbering and
-# keeps the temp out of the picker glob (which does not match dotfiles).
+# reading is represented. The tracker is a single line "TS5|5U|5R|TS7|7U|7R" with a SEPARATE
+# change timestamp PER WINDOW: rate_limits change only on an API call, and the two windows can
+# change independently, so each window keeps its OWN "last changed" stamp. Stamp TS5/TS7 = now
+# ONLY for the window whose reading actually differs from what we stored (a byte-identical
+# window KEEPS its old TS - it did not change); the untouched window's TS is preserved verbatim.
+# A shared single TS was a bug: 5h churn would restamp the whole line and make a STALE 7d in
+# that same line look freshest, letting it win the account-wide pick with a stale countdown.
+# No rate_limits at all (cur == "|||") or an empty extraction: nothing to track. Requires a
+# valid now. Atomic write (temp in the same dir + mv), the same pattern as the raw write; the
+# "." prefix + $$ keeps concurrent renders from clobbering and keeps the temp out of the picker
+# glob (no dotfiles). MIGRATION: an old 5-field line "TS|5U|5R|7U|7R" is read as 6 fields (p6
+# empty), so its stored 7d pair mismatches this render's and the line is rewritten in the new
+# format on the next render; in the interim the picker parses its a[4..6] as a bogus 7d that
+# consider() rejects (empty resets_at), so an old-format stale 7d can never win.
 rl_final="$dir/telemetry-rl-$sid"
 case "$cur" in
   ''|'|||') : ;;
   *)
     if [ -n "$now" ]; then
-      prev_line=""
+      # Split THIS render's reading "5U|5R|7U|7R" into per-window pairs cur5="5U|5R" and
+      # cur7="7U|7R" using pure parameter expansion (no extra process).
+      cur_rest="${cur#*|}"; cur_5u="${cur%%|*}"; cur_5r="${cur_rest%%|*}"
+      cur_7r="${cur##*|}"; cur_mid="${cur%|*}"; cur_7u="${cur_mid##*|}"
+      cur5="$cur_5u|$cur_5r"; cur7="$cur_7u|$cur_7r"
+      p1=""; p2=""; p3=""; p4=""; p5=""; p6=""; have=0
       if [ -f "$rl_final" ] && [ -r "$rl_final" ]; then
-        # `read` builtin: no per-render process. `|| :` keeps the partial content on a
-        # no-trailing-newline EOF (our writer emits no trailing newline).
-        IFS= read -r prev_line < "$rl_final" 2>/dev/null || :
+        have=1
+        # Split the stored line on "|" into its 6 fields. `|| :` keeps the partial content on
+        # a no-trailing-newline EOF (our writer emits no trailing newline). IFS is scoped to
+        # this one `read` (a prefix assignment) so it does not leak.
+        IFS='|' read -r p1 p2 p3 p4 p5 p6 < "$rl_final" 2>/dev/null || :
       fi
-      prev_vals="${prev_line#*|}"   # stored "5U|5R|7U|7R" = everything after the first "|"
-      if [ ! -f "$rl_final" ] || [ "$cur" != "$prev_vals" ]; then
+      prev5="$p2|$p3"; prev7="$p5|$p6"
+      if [ "$have" -eq 0 ] || [ "$cur5" != "$prev5" ] || [ "$cur7" != "$prev7" ]; then
+        # Per-window TS: restamp only the window that changed; keep the other's stored TS.
+        if [ "$have" -eq 0 ] || [ "$cur5" != "$prev5" ]; then ts5="$now"; else ts5="$p1"; fi
+        if [ "$have" -eq 0 ] || [ "$cur7" != "$prev7" ]; then ts7="$now"; else ts7="$p4"; fi
         rl_tmp="$dir/.telemetry-rl-$sid.$$.tmp"
-        if printf '%s|%s' "$now" "$cur" > "$rl_tmp" 2>/dev/null; then
+        if printf '%s|%s|%s|%s' "$ts5" "$cur5" "$ts7" "$cur7" > "$rl_tmp" 2>/dev/null; then
           mv -f "$rl_tmp" "$rl_final" 2>/dev/null || rm -f "$rl_tmp" 2>/dev/null || true
         fi
       fi
@@ -235,9 +253,11 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     while (match(m, /[0-9]-[0-9]/)) m = substr(m, 1, RSTART) "." substr(m, RSTART + 2)
     return m
   }
-  # Compact "~time-left" from an absolute reset epoch (UNCHANGED). Two units max; trailing
-  # unit shown only when non-zero; "~<1m" under a minute, "~now" at or past reset. Omits when
-  # now/resets_at missing, resets_at not a plausible epoch (< 1e9), or the gap exceeds maxsec.
+  # Compact "~time-left" from an absolute reset epoch. Two units max; trailing unit shown
+  # only when non-zero; "~<1m" under a minute. The "~now" branch (sec <= 0) is DEAD from the
+  # picker path - consider() excludes r <= now - kept only as defense in depth; the bar can
+  # never render "~now". Omits when now/resets_at missing, resets_at not a plausible epoch
+  # (< 1e9), or the gap exceeds maxsec.
   function countdown(rsat, maxsec,   sec, d, h, m) {
     if (rsat == "" || now == "") return ""
     if (rsat + 0 < 1000000000) return ""
@@ -257,7 +277,13 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     r = rsat + 0
     if (r < 1e9 || r >= 1e11) return
     cap = (win == 5) ? 21600 : 691200
-    if (now != "" && r > now + cap) return
+    # resets_at must be in the FUTURE and within the window horizon: (now, now+cap]. A valid
+    # current reading always has a future reset boundary; a reset that already ELAPSED means
+    # that reading predates the last window reset (stale - the window has since reset), so
+    # exclude it even if its change-TS is recent (an anomalous session can restamp a fresh TS
+    # while still reporting an old, already-passed reset). This also stops the display from
+    # showing a misleading "~now" sourced from a stale reading.
+    if (now != "" && (r <= now || r > now + cap)) return
     t = ts + 0
     # TS is the ranking key, so it must be bounded: a change can only have happened in the
     # PAST. Reject a FUTURE TS (> now + 60s slack for same-machine render jitter) so a corrupt
@@ -267,9 +293,12 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     if (win == 5) { if (!h5 || t > ts5) { ts5 = t; u5 = u; r5 = r; h5 = 1 } }
     else          { if (!h7 || t > ts7) { ts7 = t; u7 = u; r7 = r; h7 = 1 } }
   }
-  # Tracker files are single-line "TS|5U|5R|7U|7R"; parse the FIRST line of each. THIS render
-  # payload ($tmp) is JSON, accumulated into J for the per-session values instead.
-  FNR == 1 && FILENAME != tmpf { split($0, a, "|"); consider(5, a[1], a[2], a[3]); consider(7, a[1], a[4], a[5]) }
+  # Tracker files are single-line "TS5|5U|5R|TS7|7U|7R" with a per-window change TS; parse the
+  # FIRST line of each. THIS render payload ($tmp) is JSON, accumulated into J for the
+  # per-session values instead. An old 5-field line self-migrates (see the writer): read here
+  # its a[6] is empty, so its 7d reading (a[5], a[6]) has an empty resets_at and consider()
+  # rejects it - an old-format stale 7d can never win in the interim before the rewrite.
+  FNR == 1 && FILENAME != tmpf { split($0, a, "|"); consider(5, a[1], a[2], a[3]); consider(7, a[4], a[5], a[6]) }
   FILENAME == tmpf { J = J $0 }
   END {
     ctx = rnd(up("context_window")); f5 = rnd(up("five_hour")); f7 = rnd(up("seven_day"))
@@ -291,6 +320,20 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
       else if (arr[i] == "7d") p = sevendseg
       else if (arr[i] == "model") p = modelseg
       if (p != "") out = (out == "") ? p : (out " | " p)
+    }
+    # Never-blank fallback that RESPECTS CCT_SEGMENTS: if nothing assembled (e.g. ctx not
+    # requested and the pinned window has nothing to show), emit "<label> --" for the FIRST
+    # requested token that is one of ctx/5h/7d - never a "ctx --" the user deliberately
+    # excluded. If the list names none of those (e.g. only "model"), emit a bare "--". The
+    # shell-level seg="ctx --" below stays ONLY as the defense for a fatally-failed awk that
+    # emits no output at all.
+    if (out == "") {
+      for (i = 1; i <= k; i++) {
+        if (arr[i] == "ctx") { out = "ctx --"; break }
+        else if (arr[i] == "5h") { out = "5h --"; break }
+        else if (arr[i] == "7d") { out = "7d --"; break }
+      }
+      if (out == "") out = "--"
     }
     printf "%s", out
   }

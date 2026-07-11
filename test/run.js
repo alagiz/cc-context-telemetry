@@ -208,24 +208,24 @@ test('account-wide CORE (the reset bug): same resets_at, NEWEST change TS wins, 
   // reporting 7d 3% (fresh, post-reset). SAME resets_at. The old code picked max usage
   // (34, the stalest); the fix picks the newest change (3).
   const out = awBar(ctxOnly(33),
-    [ { sid: 'A', line: '1000|||34|' + R7 },
-      { sid: 'B', line: '2000|||3|' + R7 } ]);
+    [ { sid: 'A', line: '|||1000|34|' + R7 },
+      { sid: 'B', line: '|||2000|3|' + R7 } ]);
   assert.strictEqual(out, 'ctx 33% | 7d 3% ~3d', 'newest change (B, 3%) wins over stale high usage (A, 34%)');
 });
 
 test('account-wide: 5h picks the reading with the newest change TS, not this or a stale one', function () {
   const R = AW_NOW + 3600;
   const out = awBar(ctxOnly(33),
-    [ { sid: 'A', line: '1000|90|' + R + '||' },     // old change, high usage
-      { sid: 'B', line: '2000|12|' + R + '||' } ]);  // newest change, low usage
+    [ { sid: 'A', line: '1000|90|' + R + '|||' },     // old change, high usage
+      { sid: 'B', line: '2000|12|' + R + '|||' } ]);  // newest change, low usage
   assert.strictEqual(out, 'ctx 33% | 5h 12% ~1h', 'newest change (B, 12%) wins; ctx from THIS session');
 });
 
 test('account-wide: a FUTURE / huge change TS is rejected (corrupt tracker or clock jump cannot pin the pick)', function () {
   const R = AW_NOW + 3600;
   const out = awBar(ctxOnly(40),
-    [ { sid: 'B', line: '2000|5|' + R + '||' },              // legit past change, low usage
-      { sid: 'X', line: '99999999999|95|' + R + '||' } ]);   // absurd future TS, high usage
+    [ { sid: 'B', line: '2000|5|' + R + '|||' },              // legit past change, low usage
+      { sid: 'X', line: '99999999999|95|' + R + '|||' } ]);   // absurd future TS, high usage
   assert.strictEqual(out, 'ctx 40% | 5h 5% ~1h', 'future-TS tracker excluded; the legit past-change reading wins');
 });
 
@@ -233,29 +233,136 @@ test('account-wide: a far-future resets_at is rejected even with the newest TS +
   const out = awBar(
     { session_id: 'C', context_window: { used_percentage: 33 },
       rate_limits: { five_hour: { used_percentage: 20, resets_at: AW_NOW + 3600 } } },
-    [ { sid: 'X', line: '9999999999|99|' + (AW_NOW + 5 * 86400) + '||' } ]);
+    [ { sid: 'X', line: '9999999999|99|' + (AW_NOW + 5 * 86400) + '|||' } ]);
   assert.strictEqual(out, 'ctx 33% | 5h 20% ~1h', 'far-future 5h reset (5d) rejected; this session (20%) wins');
 });
 
-test('account-wide: all trackers have a past reset -> newest change wins, countdown honestly ~now', function () {
+test('account-wide: trackers whose reset already ELAPSED are excluded as stale (no ~now)', function () {
+  // Both trackers report a reset in the PAST -> their window has since reset -> stale, so
+  // NEITHER can win (even the newest-TS one). This session has no rate_limits, so 5h is
+  // simply omitted. A stale past-reset reading must never surface, and ~now must never show.
   const out = awBar(ctxOnly(33),
-    [ { sid: 'A', line: '1000|80|' + (AW_NOW - 3600) + '||' },
-      { sid: 'B', line: '2000|60|' + (AW_NOW - 7200) + '||' } ]);
-  assert.strictEqual(out, 'ctx 33% | 5h 60% ~now', 'newest change (B) wins even with a further-past reset; ~now');
+    [ { sid: 'A', line: '1000|80|' + (AW_NOW - 3600) + '|||' },
+      { sid: 'B', line: '2000|60|' + (AW_NOW - 7200) + '|||' } ]);
+  assert.strictEqual(out, 'ctx 33%', 'all past-reset trackers excluded; 5h omitted, never ~now');
+});
+
+test('account-wide: a past-reset tracker loses to a FUTURE-reset one even with a newer TS', function () {
+  // A: newest change but its reset already elapsed (stale). B: older change but a valid
+  // future reset. B must win - a future boundary beats a fresher-but-stale reading.
+  const out = awBar(ctxOnly(33),
+    [ { sid: 'A', line: '9000|80|' + (AW_NOW - 3600) + '|||' },      // newest TS, PAST reset
+      { sid: 'B', line: '2000|12|' + (AW_NOW + 3600) + '|||' } ]);   // older TS, FUTURE reset
+  assert.strictEqual(out, 'ctx 33% | 5h 12% ~1h', 'valid future-reset reading (B) wins over stale past-reset (A)');
+});
+
+// --- Full state-matrix pins (each row of the tracker/reset/window space) ---
+
+test('matrix: MIXED windows - 5h elapsed (idle case) falls back w/o countdown, 7d still valid shows one', function () {
+  // The 5h boundary passes routinely between API calls; that must NOT degrade the 7d field.
+  const dir = tmpDir();
+  writeRl(dir, 'A', (AW_NOW - 600) + '|40|' + (AW_NOW - 100) + '|' + (AW_NOW - 600) + '|21|' + (AW_NOW + 200000));
+  const out = runEntry({ session_id: 'C', context_window: { used_percentage: 50 },
+    rate_limits: { five_hour: { used_percentage: 40, resets_at: AW_NOW - 100 },
+      seven_day: { used_percentage: 21, resets_at: AW_NOW + 200000 } } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 50% | 5h 40% | 7d 21% ~2d7h', '5h usage w/o countdown; 7d full');
+});
+
+test('matrix: corrupt tracker lines (extra pipes / empty / garbage) are skipped, never fatal or leaked', function () {
+  const dir = tmpDir();
+  writeRl(dir, 'A', '|||' + (AW_NOW - 600) + '|21|' + (AW_NOW + 200000)); // valid 7d-only
+  writeRl(dir, 'bad1', 'garbage|not|a|tracker|line|extra|pipes');
+  writeRl(dir, 'bad2', '\n');
+  const out = runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 50% | 7d 21% ~2d7h', 'corrupt lines skipped; valid reading intact');
+});
+
+test('matrix: non-numeric TS coerces low - loses to any valid TS, but a valid reading still shows if alone', function () {
+  const dir = tmpDir();
+  writeRl(dir, 'X', 'notanumber|12|' + (AW_NOW + 3600) + '|||');
+  const alone = runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(alone, 'ctx 50% | 5h 12% ~1h', 'garbage TS alone: reading is valid, shown');
+  writeRl(dir, 'B', '2000|30|' + (AW_NOW + 3600) + '|||');
+  const paired = runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(paired, 'ctx 50% | 5h 30% ~1h', 'garbage TS (coerced 0) loses to a real TS');
+});
+
+test('matrix: reset exactly AT now is excluded (boundary elapsed); 1s in the future is accepted', function () {
+  const dir = tmpDir();
+  writeRl(dir, 'A', '2000|40|' + AW_NOW + '|||');           // r == now -> elapsed
+  const at = runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(at, 'ctx 50%', 'r == now excluded');
+  writeRl(dir, 'A', '2000|40|' + (AW_NOW + 1) + '|||');     // r == now+1 -> valid
+  const future = runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(future, 'ctx 50% | 5h 40% ~<1m', 'r == now+1 accepted');
+});
+
+test('matrix: this session ITSELF wins normally - fresh payload writes its tracker and shows countdowns', function () {
+  const dir = tmpDir();
+  const out = runEntry({ session_id: 'C', context_window: { used_percentage: 50 },
+    rate_limits: { five_hour: { used_percentage: 9, resets_at: AW_NOW + 7200 },
+      seven_day: { used_percentage: 21, resets_at: AW_NOW + 200000 } } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 50% | 5h 9% ~2h | 7d 21% ~2d7h', 'own fresh reading, full countdowns');
+});
+
+test('matrix: CRLF tracker line parses (trailing \\r lands on the last field, numeric coercion holds)', function () {
+  const dir = tmpDir();
+  writeRl(dir, 'A', '2000|12|' + (AW_NOW + 3600) + '|||\r\n');
+  const out = runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 50% | 5h 12% ~1h', 'CRLF tracker still yields the correct reading');
+});
+
+test('matrix: TS slack boundary - now+60 accepted, now+61 rejected', function () {
+  const dir = tmpDir();
+  const R = AW_NOW + 3600;
+  writeRl(dir, 'A', (AW_NOW + 60) + '|12|' + R + '|||');
+  assert.strictEqual(runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 50% | 5h 12% ~1h', 'TS == now+60 accepted');
+  writeRl(dir, 'A', (AW_NOW + 61) + '|12|' + R + '|||');
+  assert.strictEqual(runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 50%', 'TS == now+61 rejected (future stamp)');
+});
+
+test('matrix: 5h reset exactly AT the horizon cap (now+21600) accepted; one past it rejected', function () {
+  const dir = tmpDir();
+  writeRl(dir, 'A', '2000|12|' + (AW_NOW + 21600) + '|||');
+  assert.strictEqual(runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 50% | 5h 12% ~6h', 'r == now+cap accepted');
+  writeRl(dir, 'A', '2000|12|' + (AW_NOW + 21601) + '|||');
+  assert.strictEqual(runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 50%', 'r just past the 5h horizon rejected');
+});
+
+test('matrix: THE INCIDENT - own 5h reading elapsed, another session has a valid one -> the valid one wins', function () {
+  const dir = tmpDir();
+  writeRl(dir, 'LIVE', (AW_NOW - 120) + '|16|' + (AW_NOW + 8400) + '|||');  // valid future reset
+  const out = runEntry({ session_id: 'C', context_window: { used_percentage: 89 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW - 525900 } } },  // ancient elapsed
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 89% | 5h 16% ~2h20m', 'valid session wins; own elapsed reading never shows ~now');
+});
+
+test('matrix: tracker-sourced float usage rounds like payload floats', function () {
+  const dir = tmpDir();
+  writeRl(dir, 'A', '2000|12.5|' + (AW_NOW + 3600) + '|||');
+  assert.strictEqual(runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 50% | 5h 13% ~1h', '12.5 -> 13');
 });
 
 test('account-wide: ctx + model always come from THIS session, never a tracker', function () {
   const out = awBar(
     { session_id: 'C', context_window: { used_percentage: 7 }, model: { id: 'claude-opus-4-8' } },
-    [ { sid: 'B', line: '2000|12|' + (AW_NOW + 3600) + '||' } ]);
+    [ { sid: 'B', line: '2000|12|' + (AW_NOW + 3600) + '|||' } ]);
   assert.strictEqual(out, 'ctx 7% | 5h 12% ~1h | opus-4.8', 'ctx 7 + model from C; 5h 12 from tracker B');
 });
 
 test('account-wide: 5h and 7d are each selected independently by their own newest change TS', function () {
   const R5 = AW_NOW + 3600, R7 = AW_NOW + 3 * 86400;
   const out = awBar(ctxOnly(33),
-    [ { sid: 'P', line: '6000|15|' + R5 + '||' },              // newest 5h holder (no 7d)
-      { sid: 'Q', line: '5000|99|' + R5 + '|40|' + R7 } ]);    // older, has 5h(99) + 7d(40)
+    [ { sid: 'P', line: '6000|15|' + R5 + '|||' },              // newest 5h holder (no 7d)
+      { sid: 'Q', line: '5000|99|' + R5 + '|5000|40|' + R7 } ]);    // older, has 5h(99) + 7d(40)
   assert.strictEqual(out, 'ctx 33% | 5h 15% ~1h | 7d 40% ~3d',
     '5h from P (newest TS, 15) over Q (older, higher 99); 7d only Q has it (40)');
 });
@@ -263,15 +370,15 @@ test('account-wide: 5h and 7d are each selected independently by their own newes
 // The tracker file itself: written on first render, TS preserved when unchanged, restamped
 // on a real change (an API call moved the reading).
 
-test('tracker: written on first render as "now|5U|5R|7U|7R"', function () {
+test('tracker: written on first render as "TS5|5U|5R|TS7|7U|7R" (both TS = now)', function () {
   const dir = tmpDir();
   runEntry({ session_id: 'T', context_window: { used_percentage: 5 },
     rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW + 3600 },
       seven_day: { used_percentage: 30, resets_at: AW_NOW + 100000 } } },
     { CCT_DIR: dir, CCT_NOW: String(AW_NOW) });
   assert.strictEqual(rlFile(dir, 'T'),
-    AW_NOW + '|12|' + (AW_NOW + 3600) + '|30|' + (AW_NOW + 100000),
-    'tracker line = TS(now)|5U|5R|7U|7R');
+    AW_NOW + '|12|' + (AW_NOW + 3600) + '|' + AW_NOW + '|30|' + (AW_NOW + 100000),
+    'tracker line = TS5(now)|5U|5R|TS7(now)|7U|7R');
 });
 
 test('tracker: NOT rewritten when the reading is byte-identical across renders (TS preserved)', function () {
@@ -284,7 +391,8 @@ test('tracker: NOT rewritten when the reading is byte-identical across renders (
   // TS must NOT advance (the byte-identical reading keeps the original TS).
   runEntry(payload, { CCT_DIR: dir, CCT_NOW: String(AW_NOW + 500) });
   assert.strictEqual(rlFile(dir, 'T2'), first, 'unchanged reading keeps its original TS');
-  assert.strictEqual(first, AW_NOW + '|12|' + (AW_NOW + 3600) + '||', 'sanity: TS is the FIRST now');
+  assert.strictEqual(first, AW_NOW + '|12|' + (AW_NOW + 3600) + '|' + AW_NOW + '||',
+    'sanity: both TS are the FIRST now; 5h-only leaves the 7d pair empty');
 });
 
 test('tracker: restamped with a NEW TS when a value changes (an API call happened)', function () {
@@ -295,14 +403,89 @@ test('tracker: restamped with a NEW TS when a value changes (an API call happene
   runEntry({ session_id: 'T3', context_window: { used_percentage: 5 },
     rate_limits: { five_hour: { used_percentage: 15, resets_at: AW_NOW + 3600 } } },
     { CCT_DIR: dir, CCT_NOW: String(AW_NOW + 500) });
-  assert.strictEqual(rlFile(dir, 'T3'), (AW_NOW + 500) + '|15|' + (AW_NOW + 3600) + '||',
-    'changed reading -> new TS + new value');
+  assert.strictEqual(rlFile(dir, 'T3'), (AW_NOW + 500) + '|15|' + (AW_NOW + 3600) + '|' + AW_NOW + '||',
+    'changed 5h -> new TS5 + new value; TS7 preserved (7d never changed, empty pair)');
 });
 
 test('tracker: NOT written at all when the payload has no rate_limits (cur is empty)', function () {
   const dir = tmpDir();
   runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) });
   assert.strictEqual(fs.existsSync(path.join(dir, 'telemetry-rl-C')), false, 'no rate_limits -> no tracker');
+});
+
+// PER-WINDOW change timestamps (FIX 1): the tracker stamps TS5 and TS7 INDEPENDENTLY, so a
+// window that did not change keeps its own TS byte-for-byte while the other restamps. This is
+// what closes the "5h churn makes a stale 7d look freshest" hole.
+
+test('tracker: only the 5h reading changes -> TS5 restamped, TS7 PRESERVED byte-for-byte', function () {
+  const dir = tmpDir();
+  const R5 = AW_NOW + 3600, R7 = AW_NOW + 100000;
+  runEntry({ session_id: 'W1', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: R5 },
+      seven_day: { used_percentage: 30, resets_at: R7 } } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW) });
+  assert.strictEqual(rlFile(dir, 'W1'),
+    AW_NOW + '|12|' + R5 + '|' + AW_NOW + '|30|' + R7, 'first render: both TS = now');
+  // Only 5h usage moves (12 -> 15); 7d identical; later now.
+  runEntry({ session_id: 'W1', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 15, resets_at: R5 },
+      seven_day: { used_percentage: 30, resets_at: R7 } } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW + 500) });
+  assert.strictEqual(rlFile(dir, 'W1'),
+    (AW_NOW + 500) + '|15|' + R5 + '|' + AW_NOW + '|30|' + R7,
+    'TS5 advanced to now+500; TS7 preserved at the original now');
+});
+
+test('tracker: only the 7d reading changes -> TS7 restamped, TS5 PRESERVED byte-for-byte', function () {
+  const dir = tmpDir();
+  const R5 = AW_NOW + 3600, R7 = AW_NOW + 100000;
+  runEntry({ session_id: 'W2', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: R5 },
+      seven_day: { used_percentage: 30, resets_at: R7 } } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW) });
+  // Only 7d usage moves (30 -> 41); 5h identical; later now.
+  runEntry({ session_id: 'W2', context_window: { used_percentage: 5 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: R5 },
+      seven_day: { used_percentage: 41, resets_at: R7 } } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW + 700) });
+  assert.strictEqual(rlFile(dir, 'W2'),
+    AW_NOW + '|12|' + R5 + '|' + (AW_NOW + 700) + '|41|' + R7,
+    'TS5 preserved at the original now; TS7 advanced to now+700');
+});
+
+test('per-window TS (THE DEVIL REPRO): A 5h-fresh but 7d-STALE cannot beat B whose 7d changed more recently', function () {
+  const dir = tmpDir();
+  const R5 = AW_NOW + 3600, R7 = AW_NOW + 4 * 86400; // A and B share the SAME future 7d boundary
+  // A: its 5h just churned (TS5 = now-10, freshest overall) but its 7d is STALE (TS7 = now-10000)
+  // still reporting 50%. Under the OLD single-shared-TS format A's whole line looked freshest,
+  // so its stale 7d 50% wrongly won with a countdown. Now TS7 is judged on its OWN merit.
+  writeRl(dir, 'A', (AW_NOW - 10) + '|5|' + R5 + '|' + (AW_NOW - 10000) + '|50|' + R7);
+  // B: no 5h reading; its 7d changed more recently (TS7 = now-60) reporting the TRUE 80%.
+  writeRl(dir, 'B', '|||' + (AW_NOW - 60) + '|80|' + R7);
+  const out = runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 33% | 5h 5% ~1h | 7d 80% ~4d',
+    'per-window TS7: B (now-60, 80%) beats A stale 7d (now-10000, 50%); A still supplies the 5h');
+});
+
+test('migration: an OLD 5-field tracker in the pool cannot let its 7d win; self-rewrites to 6-field on its next render', function () {
+  const dir = tmpDir();
+  const R5 = AW_NOW + 3600, R7 = AW_NOW + 3 * 86400;
+  // Old single-TS format on disk: "TS|5U|5R|7U|7R".
+  writeRl(dir, 'OLD', '1000|5|' + R5 + '|34|' + R7);
+  // INTERIM: another session renders. The picker reads OLD as 6 fields: a[4]=34 (TS7),
+  // a[5]=R7 (7U), a[6]='' (7R) -> empty resets_at -> 7d REJECTED. 5h (a[1..3]) still valid.
+  const interim = runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(interim, 'ctx 50% | 5h 5% ~1h', 'old-format 7d (34%) cannot win; 5h still read');
+  // OLD renders its OWN payload -> the tracker is rewritten in 6-field format. Its 5h pair is
+  // byte-identical to the stored one so TS5 is preserved (1000); the 7d pair mismatches the
+  // stored "R7|" so TS7 restamps to now.
+  runEntry({ session_id: 'OLD', context_window: { used_percentage: 20 },
+    rate_limits: { five_hour: { used_percentage: 5, resets_at: R5 },
+      seven_day: { used_percentage: 34, resets_at: R7 } } },
+    { CCT_DIR: dir, CCT_NOW: String(AW_NOW) });
+  assert.strictEqual(rlFile(dir, 'OLD'),
+    '1000|5|' + R5 + '|' + AW_NOW + '|34|' + R7,
+    'rewritten to 6-field TS5|5U|5R|TS7|7U|7R (TS5 preserved, TS7 restamped)');
 });
 
 // Fallback semantics: when the picker finds no valid entry for a window (now invalid, or
@@ -313,7 +496,7 @@ test('account-wide fallback: now invalid -> THIS session usage, no countdown (tr
   const out = awBar(
     { session_id: 'C', context_window: { used_percentage: 33 },
       rate_limits: { five_hour: { used_percentage: 20, resets_at: AW_NOW + 3600 } } },
-    [ { sid: 'X', line: '9999|99|' + (AW_NOW + 3600) + '||' } ],
+    [ { sid: 'X', line: '9999|99|' + (AW_NOW + 3600) + '|||' } ],
     'garbage');
   assert.strictEqual(out, 'ctx 33% | 5h 20%', 'now unset -> current session 20%, not tracker 99%, no countdown');
 });
@@ -346,7 +529,7 @@ test('account-wide: an unreadable or non-regular tracker file is SKIPPED, segmen
   const dir = tmpDir();
   fs.mkdirSync(path.join(dir, 'telemetry-rl-adir'));      // a dir matching the glob (non-regular)
   const bad = path.join(dir, 'telemetry-rl-bad');
-  fs.writeFileSync(bad, '2000|99|' + (AW_NOW + 3600) + '||'); fs.chmodSync(bad, 0);  // unreadable
+  fs.writeFileSync(bad, '2000|99|' + (AW_NOW + 3600) + '|||'); fs.chmodSync(bad, 0);  // unreadable
   const out = runEntry({ session_id: 'C', context_window: { used_percentage: 33 },
     rate_limits: { five_hour: { used_percentage: 20, resets_at: AW_NOW + 3600 } } },
     { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
@@ -356,7 +539,7 @@ test('account-wide: an unreadable or non-regular tracker file is SKIPPED, segmen
 
 test('account-wide: the tracker pool is NOT leaked to CCT_WRAP as positional args', function () {
   const dir = tmpDir();
-  writeRl(dir, 'B', '2000|12|' + (AW_NOW + 3600) + '||');
+  writeRl(dir, 'B', '2000|12|' + (AW_NOW + 3600) + '|||');
   const r = runEntry({ session_id: 'C', context_window: { used_percentage: 33 } },
     { CCT_DIR: dir, CCT_NOW: String(AW_NOW), CCT_WRAP: 'printf "[argc=%s]" "$#"' });
   assert.strictEqual(r.stdout, 'ctx 33% | 5h 12% ~1h [argc=0]', 'CCT_WRAP sees no argv from the glob');
@@ -401,6 +584,39 @@ test('segments: unknown tokens are ignored (fail-soft)', function () {
 });
 test('segments: model absent in the payload -> no model segment even if requested', function () {
   assert.strictEqual(segBar({ session_id: 'M', context_window: { used_percentage: 48 } }, 'ctx,model'), 'ctx 48%');
+});
+
+// NEVER-BLANK FALLBACK RESPECTS CCT_SEGMENTS (FIX 2): when nothing assembles and ctx was NOT
+// requested, the fallback must NOT inject a "ctx --" the user excluded - it emits "<label> --"
+// for the first requested ctx/5h/7d token, or a bare "--" if the list names none of those.
+
+test('never-blank: CCT_SEGMENTS="5h" with nothing valid emits "5h --", NOT the excluded "ctx --"', function () {
+  // The devil repro: only an ELAPSED 5h reading in the pool, and the payload has no rate_limits.
+  const dir = tmpDir();
+  writeRl(dir, 'A', '1000|80|' + (AW_NOW - 3600) + '|||');  // elapsed 5h -> excluded by the picker
+  const out = runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW), CCT_SEGMENTS: '5h' }).stdout;
+  assert.strictEqual(out, '5h --', 'fallback labels the requested window, never a ctx the user dropped');
+});
+
+test('never-blank: CCT_SEGMENTS="7d" with nothing valid emits "7d --"', function () {
+  const out = runEntry(ctxOnly(50), { CCT_DIR: tmpDir(), CCT_NOW: String(AW_NOW), CCT_SEGMENTS: '7d' }).stdout;
+  assert.strictEqual(out, '7d --', 'requested 7d, nothing to show -> 7d --');
+});
+
+test('never-blank: CCT_SEGMENTS="model" with no model emits a bare "--" (no ctx/5h/7d to label)', function () {
+  const out = runEntry(ctxOnly(50), { CCT_DIR: tmpDir(), CCT_NOW: String(AW_NOW), CCT_SEGMENTS: 'model' }).stdout;
+  assert.strictEqual(out, '--', 'list names none of ctx/5h/7d -> bare --');
+});
+
+test('never-blank: CCT_SEGMENTS="model,7d" with nothing -> first labelable token wins -> "7d --"', function () {
+  const out = runEntry(ctxOnly(50), { CCT_DIR: tmpDir(), CCT_NOW: String(AW_NOW), CCT_SEGMENTS: 'model,7d' }).stdout;
+  assert.strictEqual(out, '7d --', 'model has no label; 7d is the first ctx/5h/7d in order');
+});
+
+test('never-blank: DEFAULT config still emits "ctx --" when ctx is requested-but-missing (unchanged)', function () {
+  const out = runEntry({ session_id: 'M', context_window: { used_percentage: null } },
+    { CCT_DIR: tmpDir(), CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx --', 'default behavior preserved: ctx requested, missing -> ctx --');
 });
 test('model: friendly token strips claude- and dots the version', function () {
   function m(id) {
@@ -543,7 +759,7 @@ test('standalone bar: malformed/empty stdin -> "ctx --", exit 0', function () {
 
 // Pinned epoch for all countdown tests (via CCT_NOW). Chosen realistic (~2023, well above
 // the 1e9 plausible-epoch floor) so "reset just passed" cases (now - gap) stay above the
-// floor and correctly render ~now, as they do with real ~1.78e9 epochs.
+// floor and are excluded as elapsed/stale (falling back to plain %), matching real epochs.
 const NOW = 1700000000;
 // Build a payload with a fixed ctx% and optional 5h/7d limits at now+secondsLeft.
 function limitsPayload(fiveLeft, sevenLeft) {
@@ -583,11 +799,11 @@ test('countdown: bare minutes tier under 1h (~44m)', function () {
 test('countdown: under a minute -> ~<1m', function () {
   assert.strictEqual(bar(30, undefined), 'ctx 51% | 5h 44% ~<1m');
 });
-test('countdown: at reset (0s) -> ~now', function () {
-  assert.strictEqual(bar(0, undefined), 'ctx 51% | 5h 44% ~now');
+test('countdown: at reset (0s) -> reading excluded (elapsed), falls back to % with no countdown', function () {
+  assert.strictEqual(bar(0, undefined), 'ctx 51% | 5h 44%');
 });
-test('countdown: past reset (negative gap) -> ~now, not a negative number', function () {
-  assert.strictEqual(bar(-5 * HOUR, undefined), 'ctx 51% | 5h 44% ~now');
+test('countdown: past reset -> reading excluded (stale), falls back to % with no countdown', function () {
+  assert.strictEqual(bar(-5 * HOUR, undefined), 'ctx 51% | 5h 44%');
 });
 test('countdown: implausible gap (>8d) is omitted, plain % stays', function () {
   assert.strictEqual(bar(9 * DAY, undefined), 'ctx 51% | 5h 44%');
@@ -951,8 +1167,8 @@ test('pruneRaw prunes stale telemetry-rl-* trackers by age, keeps fresh ones', f
   api.ensureDir();
   const oldRl = path.join(dir, 'telemetry-rl-old');
   const freshRl = path.join(dir, 'telemetry-rl-fresh');
-  fs.writeFileSync(oldRl, '1000|5|1700003600||');
-  fs.writeFileSync(freshRl, '2000|5|1700003600||');
+  fs.writeFileSync(oldRl, '1000|5|1700003600|||');
+  fs.writeFileSync(freshRl, '2000|5|1700003600|||');
   const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
   fs.utimesSync(oldRl, twoDaysAgo, twoDaysAgo);
   api.pruneRaw();
@@ -968,7 +1184,7 @@ test('pruneRaw caps telemetry-rl-* independently of telemetry-raw-*', function (
   const base = Date.now();
   for (let i = 0; i < 4; i++) {
     const p = path.join(dir, 'telemetry-rl-s' + i);
-    fs.writeFileSync(p, '1000|5|1700003600||');
+    fs.writeFileSync(p, '1000|5|1700003600|||');
     const t = (base - i * 1000) / 1000; // s0 newest, s3 oldest
     fs.utimesSync(p, t, t);
   }
@@ -987,7 +1203,7 @@ test('pruneRaw reclaims a STALE telemetry-rl-* atomic-write .tmp leftover', func
   const dir = tmpDir(); process.env.CCT_DIR = dir;
   api.ensureDir();
   const staleTmp = path.join(dir, '.telemetry-rl-s.12345.tmp');
-  fs.writeFileSync(staleTmp, '1000|5|1700003600||');
+  fs.writeFileSync(staleTmp, '1000|5|1700003600|||');
   const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
   fs.utimesSync(staleTmp, twoDaysAgo, twoDaysAgo);
   api.pruneRaw();
