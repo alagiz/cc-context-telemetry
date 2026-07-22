@@ -1,7 +1,7 @@
 {
   "name": "cc-context-telemetry",
-  "version": "1.4.1",
-  "description": "A Claude Code statusLine wrapper that bridges context % and rate-limit telemetry to your hooks and plugins, while keeping your existing bar.",
+  "version": "1.4.2",
+  "description": "A Claude Code statusLine wrapper that bridges context % and usage limits to your hooks and plugins, while keeping your existing bar.",
   "main": "index.js",
   "bin": {
     "cc-context-telemetry-statusline": "bin/cct-statusline"
@@ -20,15 +20,15 @@
     "context"
   ],
   "license": "MIT",
-  "author": "alagiz <alagizov@gmail.com>",
+  "author": "Technical Turtle <hello@technical-turtle.com>",
   "repository": {
     "type": "git",
-    "url": "https://github.com/alagiz/cc-context-telemetry"
+    "url": "https://github.com/technical-turtle/cc-context-telemetry"
   },
   "bugs": {
-    "url": "https://github.com/alagiz/cc-context-telemetry/issues"
+    "url": "https://github.com/technical-turtle/cc-context-telemetry/issues"
   },
-  "homepage": "https://github.com/alagiz/cc-context-telemetry#readme",
+  "homepage": "https://github.com/technical-turtle/cc-context-telemetry#readme",
   "files": [
     "index.js",
     "bin/",

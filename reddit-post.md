@@ -53,4 +53,4 @@ feedback is welcome.
 
 npm: [https://npmjs.com/package/cc-context-telemetry](https://npmjs.com/package/cc-context-telemetry)
 
-GitHub: [https://github.com/alagiz/cc-context-telemetry](https://github.com/alagiz/cc-context-telemetry)
+GitHub: [https://github.com/technical-turtle/cc-context-telemetry](https://github.com/technical-turtle/cc-context-telemetry)

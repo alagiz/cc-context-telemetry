@@ -1,7 +1,7 @@
 # cc-context-telemetry
 
 [![npm](https://img.shields.io/npm/v/cc-context-telemetry)](https://www.npmjs.com/package/cc-context-telemetry)
-[![CI](https://github.com/alagiz/cc-context-telemetry/actions/workflows/ci.yml/badge.svg)](https://github.com/alagiz/cc-context-telemetry/actions/workflows/ci.yml)
+[![CI](https://github.com/technical-turtle/cc-context-telemetry/actions/workflows/ci.yml/badge.svg)](https://github.com/technical-turtle/cc-context-telemetry/actions/workflows/ci.yml)
 [![license](https://img.shields.io/npm/l/cc-context-telemetry)](./LICENSE)
 
 Show Claude Code's context % and Pro/Max rate-limit usage (with how long until each limit
