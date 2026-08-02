@@ -85,12 +85,26 @@ fi
 # payload ($tmp).
 #
 # 5h/7d are ACCOUNT-WIDE. Claude Code refreshes rate_limits only when a session makes an API
-# call, so different open sessions disagree and a session that has not called recently keeps
-# reporting its OLD reading (even after a limit RESET, when usage has actually dropped). So we
-# do NOT pick by max usage or max resets_at (that would surface the STALEST session after a
-# reset). Instead each session records WHEN its own rate_limits last CHANGED in a per-session
-# tracker file (telemetry-rl-<sid>), and the picker chooses, per window, the reading whose
-# change is most recent ("latest API call wins"). See the tracker write + picker below.
+# call, so different open sessions disagree: a session that has not called recently keeps
+# reporting its OLD reading. The picker below chooses, per window, by (resets_at DESC, then
+# used_percentage DESC) among readings whose reset is still in the FUTURE (see consider()).
+# WHY that ordering is correct (both 5h and 7d are FIXED-window quotas that reset and start a
+# new window; verified against live payloads - e.g. 7d resets_at sits on a 604800s grid and
+# every concurrent session shares the identical current boundary):
+#   - Within ONE window (same resets_at) account usage only ever GROWS, so among same-boundary
+#     readings the HIGHEST used% is the most recent one. A stale session sampled earlier in the
+#     window reports a LOWER used% for that same boundary and must lose -> the used-DESC tie.
+#   - A reset ADVANCES resets_at, so the current window's boundary is strictly LATER than any
+#     prior window's, and a pre-reset high carries an OLD boundary that has since ELAPSED and is
+#     excluded by consider() (r <= now). So max-resets_at picks the current window and can never
+#     resurface a stale pre-reset high.
+# (The ordering also stays correct if a window were ever SLIDING rather than fixed: a later
+# resets_at is then just a more recent sample. Correctness does not hinge on the reset model,
+# only on resets_at being non-decreasing in sample-freshness, which holds either way.)
+# A per-session tracker file (telemetry-rl-<sid>) still records WHEN each window last CHANGED,
+# but that change-TS is NO LONGER the ranking key: an actively-used session whose Claude Code
+# payload is stale restamps a fresh TS onto an OLD reading, so "newest change-TS wins" let a
+# stale-low reading win the account-wide pick (the 24%-vs-96% bug). resets_at+used is immune.
 #
 # now comes from CCT_NOW when set (a deterministic test seam, unused in production) else
 # `date +%s`; countdown is a pure DURATION so no timezone math. now must be valid for the
@@ -269,9 +283,11 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     if (sec < 86400) { h = int(sec/3600); m = int((sec%3600)/60); return (m == 0) ? ("~" h "h") : ("~" h "h" m "m") }
     d = int(sec/86400); h = int((sec%86400)/3600); return (h == 0) ? ("~" d "d") : ("~" d "d" h "h")
   }
-  # Rank one tracker entry into the per-window freshest by CHANGE TIME (largest TS wins).
-  # Guards: the value is present, resets_at is a plausible epoch, and (when now is valid) the
-  # reset is within the window horizon so a corrupt/foreign far-future reading cannot win.
+  # Rank one tracker entry into the per-window freshest by (resets_at DESC, then used DESC).
+  # Guards: value present, resets_at a plausible epoch, reset in the FUTURE and within the
+  # window horizon (elapsed/corrupt/far-future readings can never win), and the change-TS not
+  # in the future (a corrupt/forward-clock tracker is dropped). See the block comment above for
+  # why resets_at+used is the correct freshness order for both the 5h and 7d fixed-window quotas.
   function consider(win, ts, u, rsat,   r, t, cap) {
     if (u == "" || rsat == "") return
     r = rsat + 0
@@ -285,13 +301,14 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     # showing a misleading "~now" sourced from a stale reading.
     if (now != "" && (r <= now || r > now + cap)) return
     t = ts + 0
-    # TS is the ranking key, so it must be bounded: a change can only have happened in the
-    # PAST. Reject a FUTURE TS (> now + 60s slack for same-machine render jitter) so a corrupt
-    # tracker or a forward clock jump cannot pin the account-wide pick to a stale reading. No
-    # low-end floor is needed: a tiny/non-numeric TS coerces low and simply loses the max.
+    # The change-TS is no longer the ranking key, but a FUTURE TS still signals a corrupt
+    # tracker or a forward clock jump, so drop it (> now + 60s slack for same-machine render
+    # jitter). A tiny/non-numeric TS coerces low and is harmless.
     if (now != "" && t > now + 60) return
-    if (win == 5) { if (!h5 || t > ts5) { ts5 = t; u5 = u; r5 = r; h5 = 1 } }
-    else          { if (!h7 || t > ts7) { ts7 = t; u7 = u; r7 = r; h7 = 1 } }
+    # Rank: newest window first (max resets_at), then within one window the freshest reading
+    # (max used). u/u5/u7 are numeric-coerced for the compare (used_percentage can be a float).
+    if (win == 5) { if (!h5 || r > r5 || (r == r5 && u + 0 > u5 + 0)) { u5 = u; r5 = r; h5 = 1 } }
+    else          { if (!h7 || r > r7 || (r == r7 && u + 0 > u7 + 0)) { u7 = u; r7 = r; h7 = 1 } }
   }
   # Tracker files are single-line "TS5|5U|5R|TS7|7U|7R" with a per-window change TS; parse the
   # FIRST line of each. THIS render payload ($tmp) is JSON, accumulated into J for the

@@ -202,23 +202,37 @@ function awBar(current, trackers, nowVal) {
 // nothing to the picker - it sees only the pre-seeded trackers.
 function ctxOnly(pct) { return { session_id: 'C', context_window: { used_percentage: pct } }; }
 
-test('account-wide CORE (the reset bug): same resets_at, NEWEST change TS wins, not max usage', function () {
+test('account-wide 7d (the 24-vs-96 bug): same resets_at, HIGHER usage wins even when a stale-low reading has a NEWER change-TS', function () {
+  // 7d is a FIXED window: within one resets_at account usage only GROWS, so the higher used%
+  // is the freshest reading. An actively-used session whose Claude Code payload is stale
+  // restamps a fresh change-TS onto its OLD low reading; that must NOT win. Live incident: one
+  // session showed 24 with a fresh TS while the others correctly showed 95, same window.
   const R7 = AW_NOW + 3 * 86400; // 3d out, within the 7d horizon
-  // A changed at TS 1000 reporting 7d 34% (stale, pre-reset); B changed later at TS 2000
-  // reporting 7d 3% (fresh, post-reset). SAME resets_at. The old code picked max usage
-  // (34, the stalest); the fix picks the newest change (3).
   const out = awBar(ctxOnly(33),
-    [ { sid: 'A', line: '|||1000|34|' + R7 },
-      { sid: 'B', line: '|||2000|3|' + R7 } ]);
-  assert.strictEqual(out, 'ctx 33% | 7d 3% ~3d', 'newest change (B, 3%) wins over stale high usage (A, 34%)');
+    [ { sid: 'STALE', line: '|||2000|24|' + R7 },   // NEWEST change TS, but stale-low
+      { sid: 'FRESH', line: '|||1000|95|' + R7 } ]); // older change TS, the true higher reading
+  assert.strictEqual(out, 'ctx 33% | 7d 95% ~3d', 'higher usage (95) wins over a newer-TS stale-low (24)');
 });
 
-test('account-wide: 5h picks the reading with the newest change TS, not this or a stale one', function () {
+test('account-wide 7d reset (elapsed-exclusion guard): a pre-reset HIGH whose boundary elapsed is dropped, so the post-reset low on the new future boundary wins', function () {
+  // A real 7d reset advances resets_at by 7d; the old window boundary elapses (r <= now) and is
+  // excluded, so last week's stale 90% can never override this week's fresh 5%. NOTE: this case
+  // is decided by the elapsed-exclusion guard, NOT by the resets_at/used ranking (it holds under
+  // the old code too); it is kept deliberately as a regression guard for that exclusion.
+  const out = awBar(ctxOnly(33),
+    [ { sid: 'LASTWEEK', line: '|||9000|90|' + (AW_NOW - 100) },        // pre-reset high, boundary just elapsed
+      { sid: 'THISWEEK', line: '|||1000|5|' + (AW_NOW + 6 * 86400) } ]); // post-reset low, new future boundary
+  assert.strictEqual(out, 'ctx 33% | 7d 5% ~6d', 'post-reset low (5) wins; elapsed pre-reset high (90) excluded');
+});
+
+test('account-wide 5h: same resets_at, HIGHER usage wins over a newer-TS stale-low reading', function () {
+  // Same 5h boundary means the same window, so the higher count is the later sample. A
+  // stale-low reading with a fresher change-TS must not win.
   const R = AW_NOW + 3600;
   const out = awBar(ctxOnly(33),
-    [ { sid: 'A', line: '1000|90|' + R + '|||' },     // old change, high usage
-      { sid: 'B', line: '2000|12|' + R + '|||' } ]);  // newest change, low usage
-  assert.strictEqual(out, 'ctx 33% | 5h 12% ~1h', 'newest change (B, 12%) wins; ctx from THIS session');
+    [ { sid: 'STALE', line: '2000|12|' + R + '|||' },   // newest TS, stale-low
+      { sid: 'FRESH', line: '1000|90|' + R + '|||' } ]); // older TS, the true higher reading
+  assert.strictEqual(out, 'ctx 33% | 5h 90% ~1h', 'higher usage (90) wins over newer-TS low (12)');
 });
 
 test('account-wide: a FUTURE / huge change TS is rejected (corrupt tracker or clock jump cannot pin the pick)', function () {
@@ -358,13 +372,13 @@ test('account-wide: ctx + model always come from THIS session, never a tracker',
   assert.strictEqual(out, 'ctx 7% | 5h 12% ~1h | opus-4.8', 'ctx 7 + model from C; 5h 12 from tracker B');
 });
 
-test('account-wide: 5h and 7d are each selected independently by their own newest change TS', function () {
-  const R5 = AW_NOW + 3600, R7 = AW_NOW + 3 * 86400;
+test('account-wide: 5h and 7d are selected INDEPENDENTLY by (resets_at, usage), not coupled', function () {
+  const R5old = AW_NOW + 1800, R5new = AW_NOW + 3600, R7 = AW_NOW + 3 * 86400;
   const out = awBar(ctxOnly(33),
-    [ { sid: 'P', line: '6000|15|' + R5 + '|||' },              // newest 5h holder (no 7d)
-      { sid: 'Q', line: '5000|99|' + R5 + '|5000|40|' + R7 } ]);    // older, has 5h(99) + 7d(40)
+    [ { sid: 'P', line: '6000|15|' + R5new + '|||' },               // later 5h boundary (recent), no 7d
+      { sid: 'Q', line: '5000|99|' + R5old + '|5000|40|' + R7 } ]); // earlier 5h boundary, plus the only 7d
   assert.strictEqual(out, 'ctx 33% | 5h 15% ~1h | 7d 40% ~3d',
-    '5h from P (newest TS, 15) over Q (older, higher 99); 7d only Q has it (40)');
+    '5h from P (later boundary, 15) though Q has higher 99; 7d only Q has it (40)');
 });
 
 // The tracker file itself: written on first render, TS preserved when unchanged, restamped
