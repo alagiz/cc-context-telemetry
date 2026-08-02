@@ -542,12 +542,16 @@ test('account-wide: a single session with no other trackers renders normally', f
 test('account-wide: an unreadable or non-regular tracker file is SKIPPED, segment stays intact', function () {
   const dir = tmpDir();
   fs.mkdirSync(path.join(dir, 'telemetry-rl-adir'));      // a dir matching the glob (non-regular)
+  // The chmod-000 "unreadable" case is POSIX-only: on Windows chmod is a no-op, so the file
+  // would be readable and its 99% would legitimately enter the pool (and now, under the
+  // resets_at/used ranking, win). Exercise the unreadable sub-case only on POSIX; the
+  // non-regular (directory) skip above is still exercised on every platform.
   const bad = path.join(dir, 'telemetry-rl-bad');
-  fs.writeFileSync(bad, '2000|99|' + (AW_NOW + 3600) + '|||'); fs.chmodSync(bad, 0);  // unreadable
+  if (!IS_WIN) { fs.writeFileSync(bad, '2000|99|' + (AW_NOW + 3600) + '|||'); fs.chmodSync(bad, 0); }  // unreadable
   const out = runEntry({ session_id: 'C', context_window: { used_percentage: 33 },
     rate_limits: { five_hour: { used_percentage: 20, resets_at: AW_NOW + 3600 } } },
     { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
-  fs.chmodSync(bad, 0o644);  // restore so the temp entry is not left unreadable
+  if (!IS_WIN) fs.chmodSync(bad, 0o644);  // restore so the temp entry is not left unreadable
   assert.strictEqual(out, 'ctx 33% | 5h 20% ~1h', 'bad tracker entries skipped, not fatal; this session (20%) shows');
 });
 
