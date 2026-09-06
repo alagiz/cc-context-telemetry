@@ -47,7 +47,7 @@ if (t?.fresh && t.contextPct >= 85) { /* near the wall: checkpoint / pause */ }
 
 to keep your existing bar instead of replacing it, add `"env": { "CCT_WRAP": "<your bar command>" }` next to `command` in the config above. pure shell on the render path, execs-through so it can't pile up. Free, MIT, zero deps, cross-platform (Linux, macOS, Windows via Git Bash).
 
-every number is only as fresh as your most-recently-active session's last API call.
+context is per session; the 5h/7d numbers are account-wide and only as fresh as the last API call any of your open sessions made.
 
 feedback is welcome.
 

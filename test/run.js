@@ -174,14 +174,20 @@ test('reset epoch: implausible values rejected, matching the shell renderer', fu
 });
 
 // ============================================================================
-// (3c) ACCOUNT-WIDE rate limits, "latest API call wins". rate_limits change ONLY when a
-// session makes an API call, so a session that has not called recently keeps reporting
-// its OLD reading (even after a limit RESET, when usage has actually dropped). Each
-// session records WHEN its own rate_limits last CHANGED in a tracker file
-// (telemetry-rl-<sid>, single line "TS|5U|5R|7U|7R"); the segment picks, per window
-// independently, the reading whose change TS is largest. This FIXES the prior reset bug
-// where a max-usage tie-break surfaced the STALEST session after a reset. ctx + model
-// stay per-session. Deterministic via CCT_NOW + pre-written tracker files.
+// (3c) ACCOUNT-WIDE rate limits. rate_limits change ONLY when a session makes an API call,
+// so a session that has not called recently keeps reporting its OLD reading (even after a
+// limit RESET, when usage has actually dropped). Every session writes its current reading to
+// a tracker file (telemetry-rl-<sid>, single line "TS5|5U|5R|TS7|7U|7R", the TS being when
+// that window last CHANGED), and the segment ranks the pool per window independently:
+//   5h: (resets_at DESC, used DESC)
+//   7d: (resets_at DESC, own-line five_hour resets_at DESC, used DESC)
+// The 5h reset epoch dates the whole line (both pairs come from the same payload), which is
+// what keeps a stale reading from winning after a MID-WINDOW quota reset - where usage drops
+// while resets_at stays put, so neither used-DESC nor the elapsed-exclusion can catch it. Only
+// the reset EPOCH dates a line; 5h usage deliberately does not, since that would re-import the
+// monotonic-usage assumption that the reset falsified. The change
+// TS is NOT a ranking key (a stale session restamps it; that was the 24-vs-96 bug), only a
+// corruption guard. ctx + model stay per-session. Deterministic via CCT_NOW + tracker files.
 // ============================================================================
 
 const AW_NOW = 1700000000;
@@ -203,10 +209,12 @@ function awBar(current, trackers, nowVal) {
 function ctxOnly(pct) { return { session_id: 'C', context_window: { used_percentage: pct } }; }
 
 test('account-wide 7d (the 24-vs-96 bug): same resets_at, HIGHER usage wins even when a stale-low reading has a NEWER change-TS', function () {
-  // 7d is a FIXED window: within one resets_at account usage only GROWS, so the higher used%
-  // is the freshest reading. An actively-used session whose Claude Code payload is stale
-  // restamps a fresh change-TS onto its OLD low reading; that must NOT win. Live incident: one
-  // session showed 24 with a fresh TS while the others correctly showed 95, same window.
+  // Neither line here carries a 5h clock, so nothing dates them and the used order is the only
+  // signal left: usually the higher used% on one boundary is the later reading, and a stale
+  // session that restamps a fresh change-TS onto its OLD low reading must NOT win on that TS.
+  // Live incident: one session showed 24 with a fresh TS while the others correctly showed 95,
+  // same window. (Used-DESC is not a freshness proof - a mid-window reset breaks it, which is
+  // what the 5h clock now handles - but it remains the best available order for undated lines.)
   const R7 = AW_NOW + 3 * 86400; // 3d out, within the 7d horizon
   const out = awBar(ctxOnly(33),
     [ { sid: 'STALE', line: '|||2000|24|' + R7 },   // NEWEST change TS, but stale-low
@@ -372,7 +380,7 @@ test('account-wide: ctx + model always come from THIS session, never a tracker',
   assert.strictEqual(out, 'ctx 7% | 5h 12% ~1h | opus-4.8', 'ctx 7 + model from C; 5h 12 from tracker B');
 });
 
-test('account-wide: 5h and 7d are selected INDEPENDENTLY by (resets_at, usage), not coupled', function () {
+test('account-wide: 5h and 7d are selected INDEPENDENTLY, not coupled', function () {
   const R5old = AW_NOW + 1800, R5new = AW_NOW + 3600, R7 = AW_NOW + 3 * 86400;
   const out = awBar(ctxOnly(33),
     [ { sid: 'P', line: '6000|15|' + R5new + '|||' },               // later 5h boundary (recent), no 7d
@@ -401,10 +409,19 @@ test('tracker: NOT rewritten when the reading is byte-identical across renders (
     rate_limits: { five_hour: { used_percentage: 12, resets_at: AW_NOW + 3600 } } };
   runEntry(payload, { CCT_DIR: dir, CCT_NOW: String(AW_NOW) });
   const first = rlFile(dir, 'T2');
+  const st1 = fs.statSync(path.join(dir, 'telemetry-rl-T2'));
   // Second render, SAME rate_limits, LATER now: the reading did not change, so its change
   // TS must NOT advance (the byte-identical reading keeps the original TS).
   runEntry(payload, { CCT_DIR: dir, CCT_NOW: String(AW_NOW + 500) });
   assert.strictEqual(rlFile(dir, 'T2'), first, 'unchanged reading keeps its original TS');
+  // Contents alone cannot tell "not rewritten" from "rewritten identically", and the difference
+  // matters: this is the per-render hot path, so an unconditional write would add a temp-file
+  // write plus a rename per render per session. The inode pins that no write happened at all
+  // (the writer replaces the file via mv, so any rewrite lands a NEW inode).
+  const st2 = fs.statSync(path.join(dir, 'telemetry-rl-T2'));
+  if (!IS_WIN) {
+    assert.strictEqual(st2.ino, st1.ino, 'no rewrite occurred: same inode, not just same bytes');
+  }
   assert.strictEqual(first, AW_NOW + '|12|' + (AW_NOW + 3600) + '|' + AW_NOW + '||',
     'sanity: both TS are the FIRST now; 5h-only leaves the 7d pair empty');
 });
@@ -467,18 +484,261 @@ test('tracker: only the 7d reading changes -> TS7 restamped, TS5 PRESERVED byte-
     'TS5 preserved at the original now; TS7 advanced to now+700');
 });
 
-test('per-window TS (THE DEVIL REPRO): A 5h-fresh but 7d-STALE cannot beat B whose 7d changed more recently', function () {
+test('7d staleness (THE DEVIL REPRO, re-premised): a line whose whole block is from an OLDER 5h window cannot beat a currently-dated line', function () {
   const dir = tmpDir();
   const R5 = AW_NOW + 3600, R7 = AW_NOW + 4 * 86400; // A and B share the SAME future 7d boundary
-  // A: its 5h just churned (TS5 = now-10, freshest overall) but its 7d is STALE (TS7 = now-10000)
-  // still reporting 50%. Under the OLD single-shared-TS format A's whole line looked freshest,
-  // so its stale 7d 50% wrongly won with a countdown. Now TS7 is judged on its OWN merit.
-  writeRl(dir, 'A', (AW_NOW - 10) + '|5|' + R5 + '|' + (AW_NOW - 10000) + '|50|' + R7);
-  // B: no 5h reading; its 7d changed more recently (TS7 = now-60) reporting the TRUE 80%.
-  writeRl(dir, 'B', '|||' + (AW_NOW - 60) + '|80|' + R7);
+  // A tracker line is written from ONE payload per render, so its 5h pair and its 7d pair always
+  // come from the SAME API response: the 5h reset epoch DATES the whole line. This test used to
+  // assert that a line with a CURRENT 5h boundary but an old TS7 was "7d-stale" and had to lose
+  // to a line with no 5h pair at all but a newer TS7. Two problems with that. First, the old
+  // fixture never tested what it claimed: under the (resets_at, used) picker it passed purely on
+  // used-DESC, and swapping the two usages flips the winner, so TS7 was irrelevant to it.
+  // Second, its ordering is the change-TS reasoning that caused the 24%-vs-96% bug: an old TS7
+  // is AMBIGUOUS (a session whose payload is frozen rewrites the identical pair every render and
+  // never restamps), so it cannot outweigh a line dated to the current 5h window. This is a
+  // deliberate trade, not a proof: we prefer a reading dated to the current 5h window over an
+  // undated one that merely restamped its change-TS. Re-premised to what staleness actually
+  // looks like on the wire: A is stale because its whole block predates the current 5h window
+  // (its 5h boundary already elapsed), even though its 7d changed recently and reads HIGHER.
+  writeRl(dir, 'A', (AW_NOW - 10) + '|5|' + (AW_NOW - 600) + '|' + (AW_NOW - 60) + '|80|' + R7);
+  // B: the currently-dated line (5h boundary still ahead), reporting the TRUE lower 50%.
+  writeRl(dir, 'B', (AW_NOW - 10000) + '|9|' + R5 + '|' + (AW_NOW - 10000) + '|50|' + R7);
   const out = runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
-  assert.strictEqual(out, 'ctx 33% | 5h 5% ~1h | 7d 80% ~4d',
-    'per-window TS7: B (now-60, 80%) beats A stale 7d (now-10000, 50%); A still supplies the 5h');
+  assert.strictEqual(out, 'ctx 33% | 5h 9% ~1h | 7d 50% ~4d',
+    'the currently-dated line (B) supplies both windows; A stale block (80%) loses despite a newer TS7');
+});
+
+// --- THE 2026-09-05 INCIDENT: a mid-window 7d quota RESET (usage dropped, boundary did NOT
+// move). Verified from the live pool: one session still reported seven_day 48% on boundary
+// 1788811200 while live sessions reported 2% then 8% on the SAME boundary. "Highest used% wins"
+// therefore pins the bar to the stalest pre-reset reading for DAYS (a 7d boundary stays in the
+// future, so the elapsed-exclusion never fires). The 7d rank now dates each reading by its own
+// 5h reset epoch first. The same pool holds an earlier drop on boundary 1783972800 (34% at an
+// older 5h clock, then 7-12% at later ones, then back up to 35% and 67% later still), so a
+// mid-window drop is not unique to 2026-09-05 - though only 2026-09-05 left the bar stuck.
+// The cases below fall into three groups, each verified by actually running this file against
+// the 1.4.3 entry (`git show <1.4.3>:bin/cct-statusline`) and against mutants of the new one:
+//   (a) FAIL under 1.4.3, so they are the evidence this change works: the re-premised DEVIL
+//       REPRO, mid-window RESET, UNDATED line, corrupt 5h clock, ELAPSED clocks still order,
+//       the clock horizon boundary pair, and the 1e9 clock floor. (7 of the 142 fail on 1.4.3.)
+//   (b) PASS under 1.4.3, but pin a PARAMETER of the new rule and are the only test that dies
+//       when it is mutated: IMPLAUSIBLE 5h clock (kills "floor removed") and SLOW LOCAL CLOCK
+//       (kills "horizon back to 21600"). They are load-bearing against drift, not evidence.
+//   (c) PASS under 1.4.3 and pin a deliberate TRADE-OFF or a generic picker guard: the KNOWN
+//       RESIDUAL, "no 5h clock anywhere" (the same shape as the 24-vs-96 test above, kept as an
+//       explicit statement that the old order survives underneath the new tier), "5h usage never
+//       steers", the boundary-over-clock precedence, the empty-used guard, the numeric/
+//       order-independent tie-break, and the 7d horizon cap. ---
+
+test('7d mid-window RESET: a stale-HIGH reading from an older 5h window loses to the fresh low one (same 7d boundary)', function () {
+  const dir = tmpDir();
+  const R7 = AW_NOW + 2 * 86400;
+  // STALE: block measured in a previous 5h window (its 5h boundary elapsed), pre-reset 48%.
+  writeRl(dir, 'STALE', (AW_NOW - 90000) + '|3|' + (AW_NOW - 30000) + '|' + (AW_NOW - 90000) + '|48|' + R7);
+  // FRESH: current 5h window, post-reset 8%.
+  writeRl(dir, 'FRESH', (AW_NOW - 100) + '|8|' + (AW_NOW + 14000) + '|' + (AW_NOW - 100) + '|8|' + R7);
+  const out = runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 33% | 5h 8% ~3h53m | 7d 8% ~2d',
+    'post-reset 8% wins; the pre-reset 48% from an elapsed 5h window is outranked');
+});
+
+test('7d rank KNOWN RESIDUAL: two readings straddling a reset INSIDE one 5h window are indistinguishable, and stay so while the account is idle', function () {
+  const dir = tmpDir();
+  const R5 = AW_NOW + 3600, R7 = AW_NOW + 3 * 86400;  // both lines share BOTH boundaries
+  // The 5h clock cannot separate readings taken inside the SAME 5h window, so used-DESC decides
+  // and the pre-reset 48% wins. The tie breaks only when some session records a reading in a
+  // LATER 5h window, which takes an API call: under continued use that is at most ~5h, but while
+  // every session is idle both clocks elapse together, the order never changes, and the stale
+  // high holds for the rest of the 7d window - no worse than before the clock, and no better.
+  // The second assertion pins exactly that, so the bound is stated by a test and not just by a
+  // comment. Pinned deliberately: the obvious "fix" is to rank these by 5h used%, which assumes
+  // 5h usage never drops mid-window - the same assumption that failed for 7d on 2026-09-05 - and
+  // would invert this pick whenever a 5h quota is reset mid-window.
+  writeRl(dir, 'STALE', (AW_NOW - 5000) + '|6|' + R5 + '|' + (AW_NOW - 5000) + '|48|' + R7);
+  writeRl(dir, 'FRESH', (AW_NOW - 100) + '|9|' + R5 + '|' + (AW_NOW - 100) + '|8|' + R7);
+  assert.strictEqual(runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 33% | 5h 9% ~1h | 7d 48% ~3d', 'same 5h clock -> used-DESC decides; documented residual, not a silent one');
+  // Same pool, 1s after that shared 5h boundary elapsed and nobody has called since: the 5h
+  // segment drops out and the stale 7d is STILL shown. The residual is bounded by the next API
+  // call, not by the boundary.
+  assert.strictEqual(runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(R5 + 1) }).stdout,
+    'ctx 33% | 7d 48% ~2d22h', 'idle past the shared boundary: both clocks elapsed, order unchanged, 48% persists');
+});
+
+test('7d rank: the 5h USAGE never steers the 7d pick (a mid-window 5h reset must not invert it)', function () {
+  const dir = tmpDir();
+  const R5 = AW_NOW + 3600, R7 = AW_NOW + 3 * 86400;
+  // The mirror of the 2026-09-05 incident: a reset zeroes the FIVE-HOUR counter without moving
+  // its boundary, so the later reading carries the LOWER 5h usage (40 -> 2) while its 7d is the
+  // true one (55). Ranking the 7d by 5h usage would pick the stale 50% here; only the 5h reset
+  // epoch is allowed to date a line, so 7d used-DESC still decides and 55% wins.
+  writeRl(dir, 'BEFORE', (AW_NOW - 3000) + '|40|' + R5 + '|' + (AW_NOW - 3000) + '|50|' + R7);
+  writeRl(dir, 'AFTER', (AW_NOW - 30) + '|2|' + R5 + '|' + (AW_NOW - 30) + '|55|' + R7);
+  const out = runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 33% | 5h 40% ~1h | 7d 55% ~3d',
+    '7d 55% survives a 5h-usage inversion (the 5h segment itself still shows the stale 40%)');
+});
+
+test('7d rank PRECEDENCE: the 7d boundary outranks the clock - a NEWER boundary wins even when its line carries an OLDER 5h clock', function () {
+  const dir = tmpDir();
+  // A real 7d reset ADVANCES the boundary. The session that saw it first can easily carry an
+  // older 5h clock than a session still frozen on the previous, still-future boundary. The
+  // boundary must decide first: swapping these two tiers renders the pre-reset 48% with a stale
+  // 2d countdown while the account is actually at 2% with 6d to go - the exact bug class this
+  // block exists to prevent, and one no other test in the file catches.
+  writeRl(dir, 'NEWBOUND', (AW_NOW - 100) + '|5|' + (AW_NOW + 1800) + '|' + (AW_NOW - 100) + '|2|' + (AW_NOW + 6 * 86400));
+  writeRl(dir, 'OLDBOUND', (AW_NOW - 100) + '|5|' + (AW_NOW + 3600) + '|' + (AW_NOW - 100) + '|48|' + (AW_NOW + 2 * 86400));
+  const out = runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 33% | 5h 5% ~1h | 7d 2% ~6d',
+    'newest 7d boundary wins outright; the older-boundary 48% cannot be promoted by a later clock');
+});
+
+test('7d rank: an UNDATED line (no 5h pair) never outranks a dated one, whatever its usage', function () {
+  const dir = tmpDir();
+  const R7 = AW_NOW + 3 * 86400;
+  // THE ONE STATE WHERE THIS RULE IS WORSE THAN 1.4.3, pinned so nobody meets it by surprise.
+  // If the FRESHEST reading is the undated one, it loses to a stale dated one, and the error
+  // UNDERSTATES the quota (1.4.3 would have shown the higher number). Reachable only from a
+  // payload carrying seven_day WITHOUT a usable five_hour, which the picker comment records as
+  // never observed (no parseable raw payload on this machine carries one window without the
+  // other; the pool grows as sessions render, so the count is deliberately not pinned here).
+  // Left as-is deliberately: separating undated lines into their own candidate track would add
+  // state to the one code path that has caused every regression in this file, to guard a payload
+  // shape that has never existed. If it ever does exist, this test is where to start.
+  writeRl(dir, 'UNDATED', '|||' + (AW_NOW - 100) + '|48|' + R7);                                  // no 5h pair
+  writeRl(dir, 'DATED', (AW_NOW - 200) + '|5|' + (AW_NOW + 3600) + '|' + (AW_NOW - 200) + '|8|' + R7);
+  const out = runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 33% | 5h 5% ~1h | 7d 8% ~3d', 'the dated line supplies the 7d (8%), not the undated 48%');
+});
+
+test('7d rank: a corrupt 5h clock (far-future or implausible) is zeroed, so it cannot pin the 7d pick', function () {
+  const R7 = AW_NOW + 3 * 86400;
+  const good = (AW_NOW - 200) + '|5|' + (AW_NOW + 3600) + '|' + (AW_NOW - 200) + '|8|' + R7;
+  [AW_NOW + 5 * 86400, 12345].forEach(function (badClock) {
+    const dir = tmpDir();
+    writeRl(dir, 'BAD', (AW_NOW - 100) + '|99|' + badClock + '|' + (AW_NOW - 100) + '|48|' + R7);
+    writeRl(dir, 'GOOD', good);
+    const out = runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+    assert.strictEqual(out, 'ctx 33% | 5h 5% ~1h | 7d 8% ~3d',
+      'corrupt 5h clock ' + badClock + ' ranks lowest; the GOOD line supplies both windows');
+  });
+});
+
+test('7d rank: an IMPLAUSIBLE 5h clock is undated, so it ties with a clockless line and used-DESC decides (guards the o < 1e9 floor)', function () {
+  const dir = tmpDir();
+  const R7 = AW_NOW + 3 * 86400;
+  // A sub-epoch 5h reset (12345) is NOT a date. Without the plausibility floor it would outrank
+  // the clockless line (12345 > 0) and pin the 7d to 10%; with it, both lines are undated and
+  // the used order decides. This is the case that makes the floor load-bearing rather than
+  // decorative: pairing a corrupt clock against a DATED line passes either way.
+  writeRl(dir, 'P', (AW_NOW - 1000) + '||12345|' + (AW_NOW - 1000) + '|10|' + R7);
+  writeRl(dir, 'Q', (AW_NOW - 1000) + '|||' + (AW_NOW - 1000) + '|90|' + R7);
+  const out = runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 33% | 7d 90% ~3d', 'sub-epoch clock is undated, not a tiny date; 90% wins');
+});
+
+test('7d rank: ELAPSED 5h clocks still ORDER the readings (the overnight-idle state, which is most of every day)', function () {
+  const dir = tmpDir();
+  const R7 = AW_NOW + 2 * 86400;
+  // Nobody has made an API call for over 5h, so EVERY line is dated to an already-elapsed 5h
+  // boundary and the 5h segment is omitted. The 7d rank must still order by that elapsed clock:
+  // treating elapsed clocks as undated would collapse the pool to used-DESC and resurrect the
+  // 2026-09-05 incident every night.
+  writeRl(dir, 'STALE', (AW_NOW - 90000) + '|3|' + (AW_NOW - 80000) + '|' + (AW_NOW - 90000) + '|48|' + R7);
+  writeRl(dir, 'LATER', (AW_NOW - 30000) + '|9|' + (AW_NOW - 25000) + '|' + (AW_NOW - 30000) + '|8|' + R7);
+  const out = runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 33% | 7d 8% ~2d', 'later elapsed 5h boundary still dates the fresher reading');
+});
+
+test('7d rank: clock horizon boundary - now+86400 still dates a line, now+86401 does not', function () {
+  const R7 = AW_NOW + 3 * 86400;
+  // OTHER supplies the 5h segment in both halves: EDGE sits beyond the 5h window horizon
+  // (now+21600), which excludes it from the 5h PICK while still dating it for the 7d rank.
+  const other = (AW_NOW - 1000) + '|5|' + (AW_NOW + 1800) + '|' + (AW_NOW - 1000) + '|8|' + R7;
+  const dirAt = tmpDir();
+  writeRl(dirAt, 'EDGE', (AW_NOW - 1000) + '|5|' + (AW_NOW + 86400) + '|' + (AW_NOW - 1000) + '|11|' + R7);
+  writeRl(dirAt, 'OTHER', other);
+  assert.strictEqual(runEntry(ctxOnly(33), { CCT_DIR: dirAt, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 33% | 5h 5% ~30m | 7d 11% ~3d', 'clock == now+86400 is a valid date and wins the 7d');
+  const dirPast = tmpDir();
+  writeRl(dirPast, 'EDGE', (AW_NOW - 1000) + '|5|' + (AW_NOW + 86401) + '|' + (AW_NOW - 1000) + '|11|' + R7);
+  writeRl(dirPast, 'OTHER', other);
+  assert.strictEqual(runEntry(ctxOnly(33), { CCT_DIR: dirPast, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 33% | 5h 5% ~30m | 7d 8% ~3d', 'clock == now+86401 is beyond the horizon -> undated, loses');
+});
+
+test('7d rank: a SLOW LOCAL CLOCK must not undate the fresh readings and hand the pick to the stale ones', function () {
+  const dir = tmpDir();
+  const R7 = AW_NOW + 3 * 86400;
+  // The machine clock is 2h slow (VM resume, bad NTP), so a genuine 5h boundary can read up to
+  // now+18000+7200 = now+25200 locally. With a horizon tighter than that the FRESH line would be
+  // marked undated while the STALE one stayed dated, inverting the pick into the 24-vs-96 bug -
+  // from clock skew alone, with no corrupt data anywhere. The horizon is a day for this reason.
+  writeRl(dir, 'FRESH', (AW_NOW - 30) + '|9|' + (AW_NOW + 25200) + '|' + (AW_NOW - 30) + '|96|' + R7);
+  writeRl(dir, 'STALE', (AW_NOW - 9000) + '|4|' + (AW_NOW + 3600) + '|' + (AW_NOW - 9000) + '|24|' + R7);
+  const out = runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 33% | 5h 4% ~1h | 7d 96% ~3d',
+    'fresh reading stays dated under a slow clock and wins the 7d (5h segment still drops it: past its own horizon)');
+});
+
+test('7d rank: the clock epoch floor is a BOUNDARY - exactly 1e9 still dates a line', function () {
+  const dir = tmpDir();
+  const R7 = AW_NOW + 3 * 86400;
+  // 1e9 is an ancient but REAL epoch, so it dates the line and outranks a clockless one. A floor
+  // of "<= 1e9" would undate it and let the used order decide instead.
+  writeRl(dir, 'ANCIENT', (AW_NOW - 1000) + '|5|1000000000|' + (AW_NOW - 1000) + '|10|' + R7);
+  writeRl(dir, 'NOCLOCK', (AW_NOW - 1000) + '|||' + (AW_NOW - 1000) + '|90|' + R7);
+  assert.strictEqual(runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 33% | 7d 10% ~3d', 'clock == 1e9 exactly is a date, so it beats the undated 90%');
+});
+
+test('7d rank: the used tie-break is NUMERIC and ORDER-INDEPENDENT (same clock, either filename order)', function () {
+  const R7 = AW_NOW + 3 * 86400, R5 = AW_NOW + 3600;
+  // Same clock on both lines, so used decides. Run it under both filename orders: the pool is a
+  // filesystem glob, so a tie-break that let the LAST file read win would be non-deterministic
+  // across machines while still passing a single-order test.
+  [['A', 'B'], ['B', 'A']].forEach(function (names) {
+    const dir = tmpDir();
+    writeRl(dir, names[0], (AW_NOW - 100) + '|5|' + R5 + '|' + (AW_NOW - 100) + '|9|' + R7);
+    writeRl(dir, names[1], (AW_NOW - 100) + '|5|' + R5 + '|' + (AW_NOW - 100) + '|10|' + R7);
+    assert.strictEqual(runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+      'ctx 33% | 5h 5% ~1h | 7d 10% ~3d', 'higher used wins in filename order ' + names.join(','));
+  });
+  // Numeric, not lexical: "9" must not beat "10", and a garbage used must not beat a real one.
+  const dir = tmpDir();
+  writeRl(dir, 'GARBAGE', (AW_NOW - 100) + '|5|' + R5 + '|' + (AW_NOW - 100) + '|zz|' + R7);
+  writeRl(dir, 'REAL', (AW_NOW - 100) + '|5|' + R5 + '|' + (AW_NOW - 100) + '|7|' + R7);
+  assert.strictEqual(runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 33% | 5h 5% ~1h | 7d 7% ~3d', 'a non-numeric used coerces to 0 and loses to a real 7%');
+});
+
+test('picker: a window with an EMPTY used but a valid resets_at is ignored, never rendered as a blank percentage', function () {
+  const dir = tmpDir();
+  const R7 = AW_NOW + 3 * 86400;
+  // Line shape "TS||R5|TS|U|R7": the 5h pair has a reset but no usage. Dropping the u == ""
+  // guard would render the malformed "5h % ~1h" instead of omitting the window.
+  writeRl(dir, 'A', (AW_NOW - 100) + '||' + (AW_NOW + 3600) + '|' + (AW_NOW - 100) + '|10|' + R7);
+  assert.strictEqual(runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 33% | 7d 10% ~3d', 'empty 5h usage -> 5h omitted entirely, 7d unaffected');
+});
+
+test('matrix: 7d reset exactly AT the horizon cap (now+691200) accepted; one past it rejected', function () {
+  const dir = tmpDir();
+  writeRl(dir, 'A', '|||' + (AW_NOW - 100) + '|12|' + (AW_NOW + 691200));
+  assert.strictEqual(runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 50% | 7d 12% ~8d', 'r == now+cap accepted');
+  writeRl(dir, 'A', '|||' + (AW_NOW - 100) + '|12|' + (AW_NOW + 691201));
+  assert.strictEqual(runEntry(ctxOnly(50), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout,
+    'ctx 50%', 'r just past the 7d horizon rejected');
+});
+
+test('7d rank: with NO 5h clock anywhere the used-DESC tie-break still stands (the 24-vs-96 rule is intact)', function () {
+  const dir = tmpDir();
+  const R7 = AW_NOW + 3 * 86400;
+  writeRl(dir, 'A', '|||' + (AW_NOW - 100) + '|24|' + R7);   // newest change TS, stale-low
+  writeRl(dir, 'B', '|||' + (AW_NOW - 9000) + '|96|' + R7);  // older change TS, the true high
+  const out = runEntry(ctxOnly(33), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) }).stdout;
+  assert.strictEqual(out, 'ctx 33% | 7d 96% ~3d', 'both undated -> highest used wins (24-vs-96 unchanged)');
 });
 
 test('migration: an OLD 5-field tracker in the pool cannot let its 7d win; self-rewrites to 6-field on its next render', function () {

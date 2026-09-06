@@ -116,13 +116,18 @@ bridges that gap: a statusLine wrapper that prepends a compact segment - context
 per-session file your hooks can read.
 
 `ctx` is per session. The 5h/7d rate limits are account-wide but Claude Code only refreshes
-them on an API call, so any single session's view is often stale. The bar therefore shows,
-per window, the reading from whichever of your open sessions ON THIS MACHINE refreshed most
-recently ("latest API call wins": each session tracks when its rate_limits last changed, and
-the newest change is picked). A reading whose reset boundary already elapsed is treated as
-stale and never picked; if no session has a current reading for a window, the bar falls back
-to this session's last-known usage with no countdown. So your open sessions agree instead of
-showing different stale numbers. It does not converge across separate machines.
+them on an API call, so any single session's view is often stale. The bar therefore shows, per
+window, the freshest reading it can identify across your open sessions ON THIS MACHINE. Each
+session records its own reading, and the bar ranks them: newest reset boundary first, then -
+for 7d - the reading's own 5h reset boundary, which dates it (both windows come from the same
+payload, and successive 5h windows are at least five hours apart, so a later 5h boundary means
+a later measurement), and only then usage. That dating is what stops a pre-reset reading from
+sticking around when your quota resets without its boundary moving, from the moment any session
+records a reading in a later 5h window. A reading whose own reset
+boundary already elapsed is treated as stale and never picked; if no session has a current
+reading for a window, the bar falls back to this session's last-known usage with no countdown.
+So your open sessions agree instead of showing different stale numbers. It does not converge
+across separate machines.
 
 One job, three pieces:
 
@@ -209,10 +214,14 @@ the telemetry directory.
 
 ## Telemetry file
 
-The pure-shell entry writes ONE file per session: the RAW Claude Code statusline
-payload, verbatim, at `<dir>/telemetry-raw-<session>.json`. It is overwritten each
-render (atomically, via a temp file + rename), so a single session never grows the
-directory. `readTelemetry(sessionId)` parses that raw file on demand. The raw payload
+The pure-shell entry writes the RAW Claude Code statusline payload, verbatim, at
+`<dir>/telemetry-raw-<session>.json`. It is overwritten each render (atomically, via a
+temp file + rename), so a single session never grows the directory. When the payload
+carries `rate_limits` it also writes a second, tiny per-session file,
+`<dir>/telemetry-rl-<session>` (one line, no extension), holding that session's last
+5h/7d reading and when each window last changed. That is what lets the bar compare your
+open sessions and show the freshest reading; nothing else reads it.
+`readTelemetry(sessionId)` parses the raw file on demand. The raw payload
 looks like (fields vary by plan/model/version - the lib reads them straight, never
 assuming a shape):
 
@@ -250,8 +259,10 @@ but a long-lived machine sees a new session id (UUID) per `claude` run. So
 `readTelemetry` prunes off the hot path (throttled, at most once per
 `CCT_PRUNE_EVERY_SEC`, default hourly): it deletes raw files older than
 `CCT_PRUNE_AGE_SEC` (default 1 day) and then caps the total at `CCT_PRUNE_MAX_FILES`
-(default 200, deleting the oldest beyond the cap). It only ever touches this lib's own
-`telemetry-raw-*.json` files. Pruning is best-effort and never throws.
+(default 200, deleting the oldest beyond the cap). The same two rules are applied
+independently to the `telemetry-rl-*` files. It only ever touches this lib's own
+`telemetry-raw-*.json` and `telemetry-rl-*` files (and its own leftover write temps),
+never anything else in the directory. Pruning is best-effort and never throws.
 
 ## Environment variables
 

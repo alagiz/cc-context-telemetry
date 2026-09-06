@@ -30,6 +30,18 @@ jobs:
         # supports OIDC trusted publishing (>= 11.5.1). Bump deliberately, never to a moving tag.
         run: npm install -g npm@11.18.0
 
+      - name: Tag must match package.json version
+        # The workflow runs from the TAG's tree, so a tag pushed against a stale package.json
+        # would publish the wrong version to npm and still cut a GitHub Release under the tag
+        # name. Fail loudly here instead, before anything is published.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $pkg" >&2
+            exit 1
+          fi
+
       - name: Tests
         run: node test/run.js
 

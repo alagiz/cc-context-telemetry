@@ -86,25 +86,69 @@ fi
 #
 # 5h/7d are ACCOUNT-WIDE. Claude Code refreshes rate_limits only when a session makes an API
 # call, so different open sessions disagree: a session that has not called recently keeps
-# reporting its OLD reading. The picker below chooses, per window, by (resets_at DESC, then
-# used_percentage DESC) among readings whose reset is still in the FUTURE (see consider()).
-# WHY that ordering is correct (both 5h and 7d are FIXED-window quotas that reset and start a
-# new window; verified against live payloads - e.g. 7d resets_at sits on a 604800s grid and
-# every concurrent session shares the identical current boundary):
-#   - Within ONE window (same resets_at) account usage only ever GROWS, so among same-boundary
-#     readings the HIGHEST used% is the most recent one. A stale session sampled earlier in the
-#     window reports a LOWER used% for that same boundary and must lose -> the used-DESC tie.
-#   - A reset ADVANCES resets_at, so the current window's boundary is strictly LATER than any
-#     prior window's, and a pre-reset high carries an OLD boundary that has since ELAPSED and is
-#     excluded by consider() (r <= now). So max-resets_at picks the current window and can never
-#     resurface a stale pre-reset high.
-# (The ordering also stays correct if a window were ever SLIDING rather than fixed: a later
-# resets_at is then just a more recent sample. Correctness does not hinge on the reset model,
-# only on resets_at being non-decreasing in sample-freshness, which holds either way.)
+# reporting its OLD reading. The picker below ranks the readings per window (see consider()),
+# among those whose own reset is still in the FUTURE:
+#   5h: (resets_at DESC, then used_percentage DESC)
+#   7d: (resets_at DESC, then the reading OWN five_hour resets_at DESC as a CLOCK, then
+#        used_percentage DESC)
+#
+# WHY. Both windows are FIXED-window quotas (verified against live payloads: 7d resets_at sits
+# on a 604800s grid and every concurrent session shares the identical current boundary), so a
+# LATER resets_at is always the newer window and a pre-reset high carries an OLD boundary that
+# has since ELAPSED and is excluded by consider() (r <= now). That handles a NORMAL reset.
+#
+# But used_percentage DESC is NOT a safe freshness order on its own. It assumes account usage
+# only ever GROWS within one boundary, and that assumption is FALSE in production: on 2026-09-05
+# the 7d quota was reset WITHOUT the weekly boundary moving (same resets_at 1788811200: one
+# session payload still reported 48%, live sessions reported 2% then 8%). "Highest used% wins"
+# then locks the bar onto the STALEST pre-reset reading for the rest of the week, because a 7d
+# boundary stays in the future for days and the elapsed-exclusion above never fires.
+#
+# So DATE each 7d reading instead of trusting its magnitude. A tracker line is written from ONE
+# payload per render, so its 5h pair and its 7d pair ALWAYS come from the SAME API response, and
+# the 5h reset epoch therefore timestamps the WHOLE line:
+#   - five_hour resets_at never moves backwards, and successive 5h windows are at least 5h apart
+#     (verified 2026-09-05 over 76 days of live pool data: every gap between consecutive distinct
+#     boundaries is >= 18000s, the smallest exactly 18000s). A reading with boundary R was
+#     measured in (R - 5h, R], so those intervals cannot overlap and a LATER 5h boundary means a
+#     STRICTLY LATER measurement.
+#   - it is ACCOUNT-WIDE, not per session (same data: a single boundary is carried identically by
+#     up to 3 concurrent sessions, and no two readings have overlapping measurement intervals - a
+#     per-session window would produce both). If it were per session this ordering would be
+#     meaningless. Single account, single machine: that is the evidence available here, not a
+#     guarantee about every account. Counts grow as sessions render, so they are not restated.
+#   - a reading whose 5h boundary already elapsed is therefore KNOWN to predate one whose 5h
+#     boundary is still ahead. Whenever any session holds a current-window reading, that bounds
+#     7d staleness to the current 5h window instead of a whole 7d window; when the account has
+#     been idle past its boundary, every reading is elapsed-dated and the clock still orders
+#     them, so the freshest one that exists wins.
+# Only when two readings carry the SAME 5h clock does used% decide, which preserves the
+# 24%-vs-96% behaviour (a stale-low 7d must not beat the true high). KNOWN RESIDUAL: two readings
+# that straddle a mid-window reset INSIDE one 5h window are indistinguishable here, so the
+# stale-high one wins until some session records a reading in a LATER 5h window. Under continued
+# use that is at most ~5h, but it takes an API call, so while every session sits idle the two
+# clocks elapse together, the order never changes, and the stale high can hold for the rest of
+# the 7d window - the same bound as before this rule (which is the honest statement: inside one
+# 5h window this rule is no worse and no better). Ranking those by 5h used% would separate them,
+# but only by assuming 5h usage never drops mid-window - the exact assumption this comment
+# documents as falsified for 7d - and it would then invert the pick whenever a 5h quota is reset
+# mid-window. Not worth it.
+# PRECONDITION: the dating works because live payloads carry five_hour alongside seven_day
+# (verified 2026-09-05 over every parseable raw payload on this machine: each carries BOTH
+# windows or NEITHER, none carries one without the other, and no five_hour lacks a numeric
+# resets_at). A reading with no/implausible/beyond-horizon 5h reset is UNDATED, ranks below every
+# dated reading, and if NO reading in the pool is dated the 7d rank degrades to the plain used%
+# order above. The one case where that is WORSE than the old order: if the FRESHEST reading were
+# the undated one it would lose to a stale dated one and the bar would UNDERSTATE the quota. That
+# needs a payload with seven_day but no usable five_hour, which has never been observed here; it
+# is pinned by a test rather than guarded, because a separate candidate track for undated lines
+# would add state to the one code path that has caused every regression in this picker.
+#
 # A per-session tracker file (telemetry-rl-<sid>) still records WHEN each window last CHANGED,
-# but that change-TS is NO LONGER the ranking key: an actively-used session whose Claude Code
-# payload is stale restamps a fresh TS onto an OLD reading, so "newest change-TS wins" let a
-# stale-low reading win the account-wide pick (the 24%-vs-96% bug). resets_at+used is immune.
+# but that change-TS is NOT a ranking key: an actively-used session whose Claude Code payload is
+# stale restamps a fresh TS onto an OLD reading, so "newest change-TS wins" let a stale-low
+# reading win the account-wide pick (the 24%-vs-96% bug). The TS is kept only as a corruption
+# guard (a FUTURE stamp drops the entry).
 #
 # now comes from CCT_NOW when set (a deterministic test seam, unused in production) else
 # `date +%s`; countdown is a pure DURATION so no timezone math. now must be valid for the
@@ -219,10 +263,11 @@ done
 # ($tmp, passed FIRST and identified by -v tmpf). 5h/7d come from the account-wide picker
 # over the tracker pool: for EACH window independently, among tracker entries that HAVE that
 # window, whose resets_at is a plausible epoch (>=1e9, <1e11) and within the window horizon
-# (5h: <= now+21600 ; 7d: <= now+691200), take the one whose change TS is largest ("latest
-# API call wins"). No valid entry (or now invalid) -> fall back to THIS session's own usage
-# with NO countdown. LC_ALL=C makes awk byte-wise (the model-id whitelist strips all high/C1
-# bytes; numbers use a "." decimal regardless of locale). countdown() is UNCHANGED.
+# (5h: <= now+21600 ; 7d: <= now+691200), take the best-ranked one (5h: resets_at then used;
+# 7d: resets_at, then the own-line five_hour resets_at as a freshness clock, then used - see
+# consider()). No valid entry (or now invalid) -> fall back to THIS session own usage with NO
+# countdown. LC_ALL=C makes awk byte-wise (the model-id whitelist strips all high/C1 bytes;
+# numbers use a "." decimal regardless of locale). countdown() is UNCHANGED.
 seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
   function objspan(key,   p, i, n, depth, start, c) {
     p = index(J, "\"" key "\"")
@@ -283,12 +328,14 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     if (sec < 86400) { h = int(sec/3600); m = int((sec%3600)/60); return (m == 0) ? ("~" h "h") : ("~" h "h" m "m") }
     d = int(sec/86400); h = int((sec%86400)/3600); return (h == 0) ? ("~" d "d") : ("~" d "d" h "h")
   }
-  # Rank one tracker entry into the per-window freshest by (resets_at DESC, then used DESC).
-  # Guards: value present, resets_at a plausible epoch, reset in the FUTURE and within the
-  # window horizon (elapsed/corrupt/far-future readings can never win), and the change-TS not
-  # in the future (a corrupt/forward-clock tracker is dropped). See the block comment above for
-  # why resets_at+used is the correct freshness order for both the 5h and 7d fixed-window quotas.
-  function consider(win, ts, u, rsat,   r, t, cap) {
+  # Rank one tracker entry into the per-window freshest. 5h: (resets_at DESC, used DESC). 7d:
+  # (resets_at DESC, then the SAME line five_hour resets_at as a freshness clock - cr - then
+  # used DESC). Guards: value present, resets_at a plausible epoch, reset in the FUTURE and
+  # within the window horizon (elapsed/corrupt/far-future readings can never win), and the
+  # change-TS not in the future (a corrupt/forward-clock tracker is dropped). See the block
+  # comment above for why the 7d rank needs the 5h clock: a mid-window quota reset makes
+  # "highest used% wins" pick the stalest reading, for days.
+  function consider(win, ts, u, rsat, cr,   r, t, cap, o) {
     if (u == "" || rsat == "") return
     r = rsat + 0
     if (r < 1e9 || r >= 1e11) return
@@ -305,17 +352,44 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     # tracker or a forward clock jump, so drop it (> now + 60s slack for same-machine render
     # jitter). A tiny/non-numeric TS coerces low and is harmless.
     if (now != "" && t > now + 60) return
-    # Rank: newest window first (max resets_at), then within one window the freshest reading
-    # (max used). u/u5/u7 are numeric-coerced for the compare (used_percentage can be a float).
-    if (win == 5) { if (!h5 || r > r5 || (r == r5 && u + 0 > u5 + 0)) { u5 = u; r5 = r; h5 = 1 } }
-    else          { if (!h7 || r > r7 || (r == r7 && u + 0 > u7 + 0)) { u7 = u; r7 = r; h7 = 1 } }
+    # 5h: newest window first (max resets_at), then within one window the later sample (max
+    # used). u/u5 are numeric-coerced for the compare (used_percentage can be a float).
+    if (win == 5) { if (!h5 || r > r5 || (r == r5 && u + 0 > u5 + 0)) { u5 = u; r5 = r; h5 = 1 }; return }
+    # 7d: newest window first, then the own-line 5h reset epoch as the freshness clock (o), then
+    # used. o = 0 marks an UNDATED line: a missing, non-numeric or sub-epoch 5h reset (the
+    # o < 1e9 test, which "" and garbage also fail), or one beyond the clock horizon, which is
+    # how a corrupt far-future epoch (including a 1e12 milliseconds misparse) is stopped from
+    # pinning the pick. Undated lines rank below every dated one and only tie among themselves,
+    # where the used% order decides, so an undated reading can still be shown when nothing better
+    # exists. The clock horizon is a DAY, deliberately far looser than the 5h window it dates: a
+    # real boundary is at most one window out (5h on every plan seen here, and a looser horizon
+    # is what keeps this honest if some plan uses a longer one), but the LOCAL clock can run slow
+    # (VM resume, bad NTP), and marking a genuinely FRESH reading undated is the worse error - it
+    # hands the pick to the stale readings that are still dated, which is the 24%-vs-96%
+    # inversion. A day tolerates about 19h of slow clock while still rejecting anything that is
+    # not a window boundary at all. The cost, stated plainly: values in (now+21600, now+86400]
+    # are refused as a 5h BOUNDARY by the 5h picker above yet accepted here as a CLOCK, and since
+    # the clock tier is a maximum, one such line outranks every genuine reading on its boundary.
+    # A slow clock does put GENUINE lines in that band (that is the case this tolerance exists
+    # for), but it shifts every line equally, so it cannot invert an ordering; only a corrupt or
+    # foreign line lands there while the others do not, and that is the one way the band can rank
+    # something wrongly. This tolerance applies to the 7d RANK only: the 5h pick above keeps the
+    # 21600 cap, because that cap also bounds what the 5h countdown may display, so under a slow
+    # clock the 5h segment can still show a stale reading (a 5h window self-heals within 5h; a 7d
+    # one does not, which is why only the 7d rank is widened).
+    # (The now != "" test is defensive only: with no valid now the END block discards the pick.)
+    o = cr + 0
+    if (o < 1e9 || (now != "" && o > now + 86400)) o = 0
+    if (!h7 || r > r7 || (r == r7 && (o > o7 || (o == o7 && u + 0 > u7 + 0)))) {
+      u7 = u; r7 = r; o7 = o; h7 = 1
+    }
   }
   # Tracker files are single-line "TS5|5U|5R|TS7|7U|7R" with a per-window change TS; parse the
   # FIRST line of each. THIS render payload ($tmp) is JSON, accumulated into J for the
   # per-session values instead. An old 5-field line self-migrates (see the writer): read here
   # its a[6] is empty, so its 7d reading (a[5], a[6]) has an empty resets_at and consider()
   # rejects it - an old-format stale 7d can never win in the interim before the rewrite.
-  FNR == 1 && FILENAME != tmpf { split($0, a, "|"); consider(5, a[1], a[2], a[3]); consider(7, a[4], a[5], a[6]) }
+  FNR == 1 && FILENAME != tmpf { split($0, a, "|"); consider(5, a[1], a[2], a[3]); consider(7, a[4], a[5], a[6], a[3]) }
   FILENAME == tmpf { J = J $0 }
   END {
     ctx = rnd(up("context_window")); f5 = rnd(up("five_hour")); f7 = rnd(up("seven_day"))
